@@ -1,4 +1,5 @@
-# AI Quantitative Trading Engine
+# SKANDA
+## The Ultimate AI Quantitative Trading Engine
 
 An autonomous multi-agent quantitative stack: Python agents use a **ReAct** (reason + act) pattern, stream logs to the UI over WebSockets, and pair with a **React (Vite)** dashboard (pink / purple / black “Carbon Mint” theme).
 
