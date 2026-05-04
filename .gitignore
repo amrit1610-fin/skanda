@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+venv/
+env/
+
+# Models & Large Files (RTX 3050 local paths)
+models/*.cbm
+.skills/
+
+# Data & Logs
+trade_history.json
+account_balance.json
+logs/*.log
+
+# Node (MERN)
+node_modules/
+dist/
+.DS_Store

@@ -1,0 +1,13 @@
+torch
+transformers
+pandas
+pandas-ta
+scipy
+numpy
+catboost
+mem0ai
+sentence-transformers
+fastapi
+uvicorn
+websockets
+ccxt

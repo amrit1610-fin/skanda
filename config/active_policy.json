@@ -1,0 +1,6 @@
+{
+    "strategy": "trendline",
+    "timeframe": "1h",
+    "interval_seconds": 1800,
+    "symbol": "BTCUSDT"
+}
