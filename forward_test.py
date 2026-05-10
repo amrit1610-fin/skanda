@@ -19,7 +19,13 @@ def get_active_strategy():
         with open(config_path, 'r') as f:
             return json.load(f)
     except Exception:
-        return {"strategy": "ema", "timeframe": "5m", "interval_seconds": 3600}
+        return {
+            "strategy": "ema",
+            "timeframe": "5m",
+            "interval_seconds": 3600,
+            "alpha_half_life_seconds": 300,
+            "alpha_decay_veto_threshold": 0.5,
+        }
 
 def get_loop_interval(policy):
     """Dynamically extracts interval_seconds, defaulting to 1 hour (3600s) if missing."""

@@ -42,11 +42,9 @@ function ControlPanel({ currentStatus, onUpdate }) {
             onChange={(e) => setStrategy(e.target.value)}
             className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:border-blue-500"
           >
-            <option value="ema">EMA Crossover</option>
-            <option value="rsi">RSI Scalper</option>
-            <option value="bollinger">Bollinger Bands</option>
-            <option value="trendline">Trendline Breakout</option>
-            <option value="macd">MACD Momentum</option>
+            <option value="ema_8_30">8/30 EMA Momentum</option>
+            <option value="ema_9_15">9/15 EMA Scalping</option>
+            <option value="trendline_break">Multi-TF Trendline Break</option>
           </select>
         </div>
 

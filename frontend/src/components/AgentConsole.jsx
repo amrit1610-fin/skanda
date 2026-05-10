@@ -13,7 +13,8 @@ function AgentConsole() {
     ws.onmessage = (event) => {
       try {
         const data = JSON.parse(event.data);
-        setLogs(prev => [...prev, data].slice(-150));
+        const logEntry = data?.event ?? data;
+        setLogs(prev => [...prev, logEntry].slice(-150));
       } catch {
         // raw text
         if (event.data?.trim()) {

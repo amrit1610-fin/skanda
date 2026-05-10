@@ -9,11 +9,9 @@ const UNIVERSE = [
 ];
 
 const STRATEGIES = [
-  { value: 'ema',       label: 'EMA Crossover',      desc: 'Trend-following via moving average crossovers' },
-  { value: 'rsi',       label: 'RSI Scalper',         desc: 'Momentum oscillator — overbought / oversold'  },
-  { value: 'bollinger', label: 'Bollinger Bands',     desc: 'Volatility breakout using band squeeze'        },
-  { value: 'trendline', label: 'Trendline Breakout',  desc: 'Structural breakout above/below key levels'   },
-  { value: 'macd',      label: 'MACD Momentum',       desc: 'Crossover of MACD histogram and signal line'  },
+  { value: 'ema_8_30', label: '8/30 EMA Momentum (Wizard)', desc: 'Identify momentum expansion. Enter on the first pullback retesting the 8 EMA.' },
+  { value: 'ema_9_15', label: '9/15 EMA Scalping (Trade Room)', desc: 'Exploit micro-trend liquidity vacuums with fanned EMAs.' },
+  { value: 'trendline_break', label: 'Multi-TF Trendline Break (Tori)', desc: 'Capitalize on fractal market structure shifts.' },
 ];
 
 const TIMEFRAMES = [
@@ -24,7 +22,7 @@ const TIMEFRAMES = [
 ];
 
 function SettingsPage({ status, onSaved }) {
-  const [strategy,  setStrategy]  = useState(status?.strategy  ?? 'rsi');
+  const [strategy,  setStrategy]  = useState(status?.strategy  ?? 'ema_8_30');
   const [timeframe, setTimeframe] = useState(status?.timeframe ?? '5m');
   const [symbol,    setSymbol]    = useState(status?.symbol ?? 'BTCUSDT');
   const [saving,    setSaving]    = useState(false);

@@ -1,19 +1,92 @@
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, ConfigDict, field_validator
+from contextlib import asynccontextmanager
 import json
 import os
+os.environ['OMP_NUM_THREADS'] = '2'
 import asyncio
 import copy
 import numpy as np
+import pandas as pd
+import uvicorn
 from typing import List, Dict
 from collections import defaultdict
 from datetime import datetime, timezone
 
 from agents.backtest_agent import run_backtest
 from agents.asset_manager import UNIVERSE as MULTI_COIN_UNIVERSE
+from agents.data_engineer import DataEngineer
+from agents.macro_economist import MacroEconomist
+from utils.account_manager import AccountManager
 
-app = FastAPI(title="AI Trader Backend API")
+ACCOUNT_MANAGER = AccountManager()
+SYSTEM_CONFIG = {"is_paper_trading": True}
+
+BASE_DIR = os.path.dirname(__file__)
+
+MACRO_ECONOMIST = None
+DATA_ENGINEER: DataEngineer | None = None
+
+
+def _read_startup_policy() -> dict:
+    config_path = os.path.join(BASE_DIR, "config", "active_policy.json")
+    try:
+        with open(config_path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {
+            "strategy": "ema",
+            "timeframe": "5m",
+            "interval_seconds": 3600,
+            "symbol": "BTCUSDT",
+        }
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global MACRO_ECONOMIST, DATA_ENGINEER
+    ACCOUNT_MANAGER.initialize_exchange(is_paper=True)
+    policy = _read_startup_policy()
+    sym = str(policy.get("symbol", "BTCUSDT")).strip().upper().replace("/", "").replace("-", "")
+    if not sym.endswith("USDT"):
+        sym = f"{sym}USDT"
+    tf = policy.get("timeframe", "5m")
+    if tf not in VALID_TIMEFRAMES:
+        tf = "5m"
+
+    DATA_ENGINEER = DataEngineer()
+    DATA_ENGINEER.warm_up_historical(sym, tf, limit=500)
+
+    MACRO_ECONOMIST = MacroEconomist()
+    try:
+        train_df = DATA_ENGINEER.get_latest_market_state()
+        if train_df.empty or len(train_df) < 80:
+            DATA_ENGINEER.warm_up_historical(sym, tf, limit=800)
+            train_df = DATA_ENGINEER.get_latest_market_state()
+        MACRO_ECONOMIST.train_model(train_df)
+    except Exception as e:
+        print(f"MacroEconomist training on live warm-up failed: {e}")
+        try:
+            MACRO_ECONOMIST.train_model(_bootstrap_macro_training_df(700))
+        except Exception as e2:
+            print(f"MacroEconomist synthetic bootstrap failed: {e2}")
+
+    _stream_task = asyncio.create_task(DATA_ENGINEER.start_live_stream(sym))
+    asyncio.create_task(tail_log_file())
+    try:
+        yield
+    finally:
+        if DATA_ENGINEER is not None:
+            DATA_ENGINEER.stop_live_stream()
+        _stream_task.cancel()
+        try:
+            await _stream_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title="AI Trader Backend API", lifespan=lifespan)
 
 # CORS: explicit dev origins + regex so alternate ports / IPv6 localhost work with Settings + Backtest UI
 app.add_middleware(
@@ -31,7 +104,88 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(__file__)
+REGIME_STRATEGY_MAP = {
+    0: "Multi-TF Trendline Break",
+    1: "8/30 EMA Momentum",
+    2: "9/15 EMA Scalping",
+}
+
+
+def _bootstrap_macro_training_df(rows: int = 500) -> pd.DataFrame:
+    rng = np.random.default_rng(7)
+    price = 30000.0
+    closes = []
+    for i in range(rows):
+        # Piecewise synthetic behavior to ensure all 3 clusters are represented.
+        if i < rows // 3:
+            shock = rng.normal(0.0, 0.0025)
+        elif i < (2 * rows) // 3:
+            shock = 0.0015 + rng.normal(0.0, 0.003)
+        else:
+            shock = rng.normal(0.0, 0.012)
+        price = max(100.0, price * (1.0 + shock))
+        closes.append(price)
+    return pd.DataFrame({"close": closes})
+
+
+def _compute_economist_data() -> dict:
+    try:
+        price_df = None
+        if DATA_ENGINEER is not None:
+            hybrid = DATA_ENGINEER.get_latest_market_state()
+            if hybrid is not None and not hybrid.empty and "close" in hybrid.columns:
+                price_df = hybrid
+
+        if price_df is None or price_df.empty:
+            recent_log_path = os.path.join(BASE_DIR, "logs", "trade_history.json")
+            if os.path.exists(recent_log_path):
+                with open(recent_log_path, "r", encoding="utf-8") as f:
+                    content = f.read().strip()
+                if content:
+                    logs = json.loads(content)
+                    prices = [x.get("entry_price") for x in logs if x.get("entry_price") is not None]
+                    price_df = pd.DataFrame({"close": prices[-240:]}) if prices else _bootstrap_macro_training_df(240)
+                else:
+                    price_df = _bootstrap_macro_training_df(240)
+            else:
+                price_df = _bootstrap_macro_training_df(240)
+
+        detection = MACRO_ECONOMIST.detect_current_regime(price_df)
+    except Exception:
+        detection = {
+            "regime_id": 0,
+            "regime_name": "Sideways / Mean Reversion",
+            "confidence_pct": 0.0,
+        }
+
+    regime_id = int(detection.get("regime_id", 0))
+    return {
+        "regime_id": regime_id,
+        "regime_name": detection.get("regime_name", "Sideways / Mean Reversion"),
+        "confidence_pct": float(round(float(detection.get("confidence_pct", 0.0)), 2)),
+        "active_strategy": REGIME_STRATEGY_MAP.get(regime_id, "8/30 EMA Momentum"),
+    }
+
+
+def _latest_signal_decay_from_logs():
+    """Most recent decay_factor from trade_history (risk + execution rows) for dashboard freshness."""
+    log_path = os.path.join(BASE_DIR, 'logs', 'trade_history.json')
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        if not content:
+            return None
+        logs = json.loads(content)
+        if not logs:
+            return None
+        for e in sorted(logs, key=lambda x: x.get("timestamp") or "", reverse=True):
+            v = e.get("decay_factor")
+            if v is not None:
+                return float(v)
+        return None
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
 
 # --- Pydantic Schemas ---
 class StrategySwitchRequest(BaseModel):
@@ -72,6 +226,9 @@ class BacktestRequest(BaseModel):
         s = (v or "BTCUSDT").strip().upper().replace("/", "")
         return s if s.endswith("USDT") else f"{s}USDT"
 
+class ToggleModeRequest(BaseModel):
+    is_paper: bool
+
 # --- WebSocket Connection Manager ---
 class ConnectionManager:
     def __init__(self):
@@ -110,13 +267,19 @@ async def tail_log_file():
                 if not line:
                     await asyncio.sleep(0.5)
                     continue
-                await manager.broadcast(line.strip())
+                payload = {"type": "stream", "economist_data": _compute_economist_data()}
+                try:
+                    payload["event"] = json.loads(line.strip())
+                except json.JSONDecodeError:
+                    payload["event"] = {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "agent": "system",
+                        "type": "info",
+                        "message": line.strip(),
+                    }
+                await manager.broadcast(json.dumps(payload))
     except Exception as e:
         print(f"File tailing error: {e}")
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(tail_log_file())
 
 # --- REST Endpoints ---
 
@@ -131,6 +294,13 @@ def get_status():
             # Ensure timeframe always present
             if "timeframe" not in data:
                 data["timeframe"] = "5m"
+            if "alpha_half_life_seconds" not in data:
+                data["alpha_half_life_seconds"] = 300
+            if "alpha_decay_veto_threshold" not in data:
+                data["alpha_decay_veto_threshold"] = 0.5
+            latest_decay = _latest_signal_decay_from_logs()
+            if latest_decay is not None:
+                data["latest_signal_decay"] = round(latest_decay, 6)
             data["asset_manager"] = {
                 "agent": "AssetManager",
                 "role": "multi_coin_lead_lag",
@@ -142,6 +312,8 @@ def get_status():
             "timeframe": "5m",
             "interval_seconds": 3600,
             "symbol": "BTCUSDT",
+            "alpha_half_life_seconds": 300,
+            "alpha_decay_veto_threshold": 0.5,
             "online": True,
             "asset_manager": {
                 "agent": "AssetManager",
@@ -198,16 +370,27 @@ def update_config(request: UpdateConfigRequest):
         sym = request.symbol
         if sym not in MULTI_COIN_UNIVERSE:
             sym = "BTCUSDT"
-        data = {
+        existing = {}
+        if os.path.exists(config_path):
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    existing = json.load(f)
+            except (json.JSONDecodeError, OSError):
+                existing = {}
+        existing.update({
             "strategy":         request.strategy.strip().lower(),
             "timeframe":        tf,
             "interval_seconds": int(request.interval_seconds),
             "symbol":           sym,
-        }
+        })
+        if "alpha_half_life_seconds" not in existing:
+            existing["alpha_half_life_seconds"] = 300
+        if "alpha_decay_veto_threshold" not in existing:
+            existing["alpha_decay_veto_threshold"] = 0.5
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
         with open(config_path, 'w') as f:
-            json.dump(data, f, indent=4)
-        return {"status": "success", "message": "Config updated", "data": data}
+            json.dump(existing, f, indent=4)
+        return {"status": "success", "message": "Config updated", "data": existing}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
@@ -220,6 +403,15 @@ def api_run_backtest(request: BacktestRequest):
     tf = request.timeframe if request.timeframe in VALID_TIMEFRAMES else "1h"
     result = run_backtest(sym, strat, timeframe=tf, months=int(request.months))
     return result
+
+@app.post("/api/toggle-mode")
+def toggle_mode(request: ToggleModeRequest):
+    """Switch system between Paper (Testnet) and Real (Mainnet) trading modes."""
+    global SYSTEM_CONFIG
+    SYSTEM_CONFIG["is_paper_trading"] = request.is_paper
+    ACCOUNT_MANAGER.initialize_exchange(request.is_paper)
+    return {"status": "success", "mode": "paper" if request.is_paper else "real"}
+
 
 def _normalize_trade_log_entry(log: dict) -> dict:
     """Ensure symbol + side exist for dashboard / exports (non-destructive for unknown keys)."""
@@ -237,6 +429,21 @@ def _normalize_trade_log_entry(log: dict) -> dict:
             e["side"] = "FLAT"
     e["strategy_used"] = e.get("strategy_used", "unknown")
     e["win_probability"] = e.get("win_probability", 0.0)
+    if e.get("decay_factor") is not None:
+        try:
+            e["decay_factor"] = float(e["decay_factor"])
+        except (TypeError, ValueError):
+            e["decay_factor"] = None
+    if e.get("pair_z_score") is not None:
+        try:
+            e["pair_z_score"] = float(e["pair_z_score"])
+        except (TypeError, ValueError):
+            e["pair_z_score"] = None
+    if e.get("pair_p_value") is not None:
+        try:
+            e["pair_p_value"] = float(e["pair_p_value"])
+        except (TypeError, ValueError):
+            pass
     return e
 
 
@@ -365,7 +572,7 @@ def get_analytics():
     veto_count = sum(1 for l in raw_logs if str(l.get("status", "")).lower() == "vetoed")
 
     # All strategies (always present in response even if empty)
-    STRATEGIES = ["ema", "rsi", "bollinger", "trendline", "macd"]
+    STRATEGIES = ["ema", "rsi", "bollinger", "trendline", "macd", "pairs_trading", "mean_reversion"]
 
     empty_response = {
         "global_metrics": {
@@ -427,3 +634,7 @@ async def websocket_endpoint(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         manager.disconnect(websocket)
+
+
+if __name__ == "__main__":
+    uvicorn.run("server:app", host="127.0.0.1", port=8000, reload=True)

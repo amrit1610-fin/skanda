@@ -1,0 +1,49 @@
+SKANDA: AI QUANTITATIVE TRADING SYSTEM - PROJECT BRIEF (INSTITUTIONAL GRADE)
+
+1. AGENTIC ORCHESTRATION (ReAct Framework)
+Skanda operates via a decentralized swarm of 8 specialized agents:
+- Data Engineer: Multi-coin OHLCV ingestion.
+- Asset Manager: Lead-Lag intelligence via Engle–Granger Cointegration.
+- Sentiment Analyst: Financial NLP scoring using FinBERT.
+- Quant Analyst: Strategy signal generation (.skills/quant_analyst/).
+- ML Engineer: Probabilistic signal validation via CatBoost.
+- Risk Manager: Veto authority with Mem0 memory & Alpha Decay logic.
+- Quant Trader: Paper execution & persistent trade logging.
+- User Proxy: Real-time UI synchronization and risk alerts.
+
+2. INSTITUTIONAL-GRADE TECHNIQUES
+- Cointegration: Statistical pair-trading detection (ADF test on residuals).
+- FinBERT: BERT-based NLP optimized for financial context.
+- Alpha Decay: Signal freshness gating (Exponential Decay formula).
+- CatBoost: Gradient boosting for high-confidence trade scoring.
+- Mem0 Memory: Semantic storage of strategy performance to detect regime failure.
+
+3. SYSTEM WORKFLOW (Example: BTCUSDT)
+1. Policy Load: Hot-reloads strategy (e.g., Trendline) and interval from config.
+2. Market IQ: Analyzes cointegrated assets and calculates sentiment scores.
+3. Signal Proposal: Quant Analyst generates trade logic; ML Engineer scores it (70%+ to proceed).
+4. Safety Veto: Risk Manager checks for signal stale-ness and recent failure strikes.
+5. Execution: Quant Trader performs paper fill; WebSocket streams log to Dashboard.
+
+4. TECHNOLOGY STACK
+- Backend: Python 3.10+, FastAPI, CCXT, Pandas-TA.
+- AI/ML: PyTorch, Transformers, CatBoost, Mem0 (ChromaDB).
+- Frontend: React 19, Vite, Tailwind CSS 4, Recharts, Lucide.
+- Visualization: Live Equity curves, Drawdown tracking, and Strategy metrics (Sharpe/Profit Factor).
+
+5. DATA PERSISTENCE
+- Active Policy: config/active_policy.json (Hot-swappable).
+- Trade History: logs/trade_history.json (Persistent audit trail).
+- Memory: logs/mem0_db (Vector-based strategy memory).
+- Live Stream: logs/agent_stream.log (Tail-able WebSocket source).
+
+
+6. STEP-BY-STEP WORKFLOW
+1. Reload Policy: Hot-reloads strategy/timeframe from config.
+2. Fetch Data: Ingests market data for the target symbols.
+3. Market Context: Calculates lead-lag and sentiment scores.
+4. Signal: Quant Analyst generates trade proposal based on MD skills.
+5. Validate: ML Engineer assigns a win-probability score.
+6. Risk Check: Risk Manager vetos or approves based on rules and history.
+7. Execute: Quant Trader updates paper wallet and logs the trade.
+8. Update UI: WebSocket streams logs to the live dashboard.

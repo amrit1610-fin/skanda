@@ -1,13 +1,26 @@
-torch
-transformers
-pandas
-pandas-ta
-scipy
-numpy
-catboost
-mem0ai
-sentence-transformers
-fastapi
-uvicorn
-websockets
-ccxt
+# Data & Math
+pandas==2.1.4
+numpy==1.26.4
+scipy==1.11.4
+statsmodels==0.14.1
+scikit-learn==1.3.2
+
+# Technical Analysis
+pandas-ta==0.3.14b0
+
+# Machine Learning & NLP
+catboost==1.2.3
+transformers==4.38.2
+sentence-transformers==2.6.1
+
+# Broker/Exchange Execution
+ccxt==4.2.80
+
+# Agent Intelligence
+mem0ai==0.1.13
+
+# Server & Real-Time
+fastapi==0.110.0
+uvicorn==0.27.1
+websockets==12.0
+python-dotenv==1.0.1

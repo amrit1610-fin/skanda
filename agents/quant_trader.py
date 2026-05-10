@@ -2,8 +2,10 @@ import os
 import json
 import random
 import time
+import ccxt
 from datetime import datetime, timezone
 from .base_agent import ReActAgent
+from .risk_manager import RiskManager
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 RISK_PER_TRADE   = 0.02      # 2% of current balance risked per trade
@@ -68,6 +70,10 @@ class QuantTrader(ReActAgent):
     def __init__(self):
         skill_path = os.path.join(os.path.dirname(__file__), '..', '.skills', 'quant_trader', 'system_prompt.md')
         super().__init__("QuantTrader", skill_path)
+        self.risk_manager = RiskManager()
+        self.exchange = ccxt.delta({
+            "options": {"defaultType": "future"},
+        })
         self._ensure_log_file()
         self._ensure_balance_file()
 
@@ -153,15 +159,36 @@ class QuantTrader(ReActAgent):
             price_source = "fallback_mock"
 
         self.think(f"Entry price: ${entry_price:,.2f} ({price_source})")
+        current_price = entry_price
 
         # ── 4. Position sizing (2% risk rule) ────────────────────────────────
         risk_amount = balance_before * RISK_PER_TRADE          # $200 on $10k
-        quantity    = round(risk_amount / entry_price, 6)       # BTC units
+        amount    = round(risk_amount / current_price, 6)       # BTC units
+        quantity = amount
 
         self.think(f"Risk amount: ${risk_amount:.2f} | Quantity: {quantity:.6f} {symbol.replace('USDT','')}")
 
-        # ── 5. Mock hold + exit price ────────────────────────────────────────
-        self.think(f"Holding position for {MOCK_HOLD_SECS}s (paper mode)...")
+        # ── 5. Bracketed Limit Order Execution ───────────────────────────────
+        side = "buy" if signal == "BUY" else "sell"
+        brackets = self.risk_manager.calculate_trade_brackets(side, current_price)
+        
+        params = {
+            'stopLossPrice': brackets['stop_loss'],
+            'takeProfitPrice': brackets['take_profit']
+        }
+
+        try:
+            # Normalise symbol to CCXT format
+            ccxt_symbol = DELTA_SYMBOL_MAP.get(symbol, symbol)
+            order = self.exchange.create_order(ccxt_symbol, 'limit', side, amount, current_price, params)
+            print(f"[QuantTrader] Executing LIMIT {side} at {current_price} | SL: {brackets['stop_loss']} | TP: {brackets['take_profit']}")
+        except Exception as e:
+            self.think(f"Order Execution Failed: {e}")
+            # Fallback for paper testing or if API fails
+            pass
+
+        # ── 6. Mock hold (Wait for fill/exit in paper mode context) ──────────
+        self.think(f"Holding position for {MOCK_HOLD_SECS}s (monitoring brackets)...")
         time.sleep(MOCK_HOLD_SECS)
 
         # Random PnL: uniform between -1.5% and +3.5% (asymmetric for realism)
@@ -194,6 +221,7 @@ class QuantTrader(ReActAgent):
             "signal_type":     signal,
             "side":            "LONG" if signal == "BUY" else "SHORT" if signal == "SELL" else "FLAT",
             "status":          "executed",
+            "decay_factor":    approved_trade.get("decay_factor"),
             "win_probability": approved_trade.get("win_probability", 0),
             "sentiment_score": approved_trade.get("sentiment_score", 0),
             # Position details
@@ -209,6 +237,19 @@ class QuantTrader(ReActAgent):
             "pnl":             pnl_pct_actual,          # fractional, used by analytics
             "final_pnl":       round(gross_pnl_usdt, 4),
         }
+
+        if approved_trade.get("signal_from_cointegration"):
+            pz = approved_trade.get("pair_z_score")
+            pp = approved_trade.get("pair_p_value")
+            if pz is not None:
+                record["pair_z_score"] = float(pz)
+            if pp is not None:
+                try:
+                    record["pair_p_value"] = float(pp)
+                except (TypeError, ValueError):
+                    record["pair_p_value"] = pp
+            if approved_trade.get("pair_leg_x"):
+                record["pair_leg_x"] = approved_trade.get("pair_leg_x")
 
         self._append_trade(record)
         self.think(f"Trade logged. Wallet updated: ${balance_before:,.2f} → ${balance_after:,.2f}")

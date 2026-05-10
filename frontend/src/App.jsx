@@ -18,6 +18,9 @@ function App() {
   const [logs,       setLogs]       = useState([]);
   const [balance,    setBalance]    = useState(null);
   const [isLive,     setIsLive]     = useState(false);
+  const [tradingMode, setTradingMode] = useState('paper');
+  const [economistData, setEconomistData] = useState(null);
+  const [systemMode, setSystemMode] = useState('auto');
 
   const fetchData = async () => {
     try {
@@ -44,23 +47,49 @@ function App() {
     return () => clearInterval(interval);
   }, []);
 
+  useEffect(() => {
+    const ws = new WebSocket('ws://localhost:8000/api/stream');
+    ws.onmessage = (event) => {
+      try {
+        const parsed = JSON.parse(event.data);
+        if (parsed?.economist_data) {
+          setEconomistData(parsed.economist_data);
+        }
+      } catch {
+        // no-op for non-JSON stream payloads
+      }
+    };
+    return () => ws.close();
+  }, []);
+
   const activeStrategy = status?.strategy ?? null;
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell ${tradingMode === 'real' ? 'border-4 border-red-600 shadow-[0_0_15px_rgba(220,38,38,0.5)]' : ''}`}>
       {/* Fixed Sidebar */}
       <Sidebar
         activePage={activePage}
         onNavigate={setActivePage}
         activeStrategy={activeStrategy}
         isLive={isLive}
+        systemMode={systemMode}
         onStrategyChange={fetchData}
       />
 
       {/* Scrollable main area (offset by sidebar width) */}
       <main className="main-content" style={{ marginLeft: 'var(--sidebar-width)' }}>
         {activePage === 'dashboard' && (
-          <DashboardPage analytics={analytics} status={status} balance={balance} />
+          <DashboardPage
+            analytics={analytics}
+            status={status}
+            balance={balance}
+            economistData={economistData}
+            tradingMode={tradingMode}
+            onToggleMode={setTradingMode}
+            systemMode={systemMode}
+            setSystemMode={setSystemMode}
+            onStrategyChange={fetchData}
+          />
         )}
         {activePage === 'tradelog' && (
           <TradeLogPage logs={logs} />

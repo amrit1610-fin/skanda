@@ -1,6 +1,8 @@
 {
-    "strategy": "trendline",
+    "strategy": "rsi",
     "timeframe": "1h",
-    "interval_seconds": 1800,
-    "symbol": "BTCUSDT"
+    "interval_seconds": 60,
+    "symbol": "BTCUSDT",
+    "alpha_half_life_seconds": 300,
+    "alpha_decay_veto_threshold": 0.5
 }

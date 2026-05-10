@@ -7,11 +7,9 @@ import {
 const PAGE_SIZE = 20;
 
 const STRATEGY_LABELS = {
-  ema:        'EMA Crossover',
-  rsi:        'RSI Scalper',
-  bollinger:  'Bollinger Bands',
-  trendline:  'Trendline Breakout',
-  macd:       'MACD Momentum',
+  ema_8_30:        '8/30 EMA Momentum',
+  ema_9_15:        '9/15 EMA Scalping',
+  trendline_break: 'Multi-TF Trendline Break',
   unknown:    'Unknown',
 };
 
@@ -21,6 +19,7 @@ const COLUMNS = [
   { key: 'quantity',      label: 'Qty'          },
   { key: 'strategy_used', label: 'Strategy'     },
   { key: 'side',          label: 'Side'         },   // NEW
+  { key: 'decay_factor',  label: 'α decay'      },
   { key: 'entry_price',   label: 'Entry'        },
   { key: 'exit_price',    label: 'Exit'         },
   { key: 'pnl',           label: 'PnL %'        },
@@ -184,6 +183,13 @@ function TradeLogPage({ logs }) {
                     {/* Side — LONG / SHORT */}
                     <td>
                       <SideCell side={side} />
+                    </td>
+
+                    {/* Alpha decay at approval */}
+                    <td style={{ fontFamily: 'monospace', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+                      {row.decay_factor != null
+                        ? `${(Number(row.decay_factor) * 100).toFixed(1)}%`
+                        : <span style={{ color: 'var(--text-faint)' }}>--</span>}
                     </td>
 
                     {/* Entry Price */}
