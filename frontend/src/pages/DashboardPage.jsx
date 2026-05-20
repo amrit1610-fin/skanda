@@ -1,9 +1,10 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
-import StatCard    from '../components/StatCard';
-import EquityChart from '../components/EquityChart';
-import PnLBarChart from '../components/PnLBarChart';
+import StatCard      from '../components/StatCard';
+import EquityChart   from '../components/EquityChart';
+import PnLBarChart   from '../components/PnLBarChart';
 import AccountSwitcher from '../components/AccountSwitcher';
+import RegimeMatrix  from '../components/RegimeMatrix';
 import { BarChart2, Activity, ShieldAlert } from 'lucide-react';
 
 const STRATEGIES = [
@@ -181,7 +182,11 @@ function DashboardPage({ analytics, status, balance, economistData, onStrategyCh
         </div>
       </div>
 
+      {/* MTF Regime Radar Card */}
+      <RegimeMatrix economistData={economistData} />
+
       {/* Page Header + Strategy Filter */}
+
       <div className="page-header">
         <div>
           <h1 className="page-title">Dashboard</h1>

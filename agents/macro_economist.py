@@ -3,8 +3,28 @@ import pandas as pd
 from sklearn.mixture import GaussianMixture
 from sklearn.preprocessing import StandardScaler
 
+# ── MTF Regime weights — higher timeframes have more authority ────────────────
+MTF_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
+MTF_WEIGHTS    = {"1m": 0.05, "5m": 0.10, "15m": 0.15, "1h": 0.25, "4h": 0.30, "1d": 0.15}
+# Score map: positive = bullish bias, negative = bearish bias
+REGIME_SCORES  = {
+    "STRONG_BULLISH": +1.0,
+    "BULLISH":        +0.6,
+    "SIDEWAYS":        0.0,
+    "BEARISH":        -0.6,
+    "STRONG_BEARISH": -1.0,
+    "UNKNOWN":         0.0,
+}
+
 
 class MacroEconomist:
+    """
+    Dual-mode macro intelligence:
+      1. GMM clustering (existing) — trained on price history, used by server.py dashboard.
+      2. MTF Regime Radar (new) — MA-stack classification across 6 timeframes,
+         used by engine.py to gate live trades.
+    """
+
     REGIME_NAME_MAP = {
         0: "Sideways / Mean Reversion",
         1: "Trend Breakout",
@@ -16,6 +36,8 @@ class MacroEconomist:
         self.scaler = StandardScaler()
         self.is_trained = False
         self.cluster_to_regime = {}
+
+    # ── Existing GMM methods (unchanged) ─────────────────────────────────────
 
     def _prepare_features(self, df: pd.DataFrame) -> pd.DataFrame:
         if df is None or df.empty:
@@ -98,4 +120,106 @@ class MacroEconomist:
             "regime_id": regime_id,
             "regime_name": regime_name,
             "confidence_pct": confidence_pct,
+        }
+
+    # ── NEW: Multi-Timeframe Regime Radar ────────────────────────────────────
+
+    @staticmethod
+    def _classify_tf_regime(df: pd.DataFrame) -> str:
+        """
+        Classifies a single timeframe's DataFrame using the EMA20/EMA50/SMA200 stack.
+
+        Alignment rules (allowing for price to 'breathe' during pullbacks):
+          EMA20 > EMA50 > SMA200 AND Price > EMA50  → STRONG_BULLISH
+          EMA20 > EMA50 AND Price > EMA50           → BULLISH (SMA200 lagging)
+          EMA20 < EMA50 < SMA200 AND Price < EMA50  → STRONG_BEARISH
+          EMA20 < EMA50 AND Price < EMA50           → BEARISH
+          Everything else                           → SIDEWAYS
+        """
+        if df is None or df.empty or "close" not in df.columns:
+            return "UNKNOWN"
+
+        # Need at least 30 rows for EMA50 to be meaningful
+        if len(df) < 30:
+            return "UNKNOWN"
+
+        close = df["close"]
+        ema20 = close.ewm(span=20, adjust=False).mean()
+        ema50 = close.ewm(span=50, adjust=False).mean()
+        sma200 = close.rolling(200).mean()
+
+        # Evaluate the most recent bar
+        price  = float(close.iloc[-1])
+        e20    = float(ema20.iloc[-1])
+        e50    = float(ema50.iloc[-1])
+        s200   = float(sma200.iloc[-1]) if not np.isnan(sma200.iloc[-1]) else None
+
+        # Bullish stack (Trend remains intact as long as price holds above the 50 EMA baseline)
+        if (e20 > e50) and (price > e50):
+            if s200 is not None and e50 > s200:
+                return "STRONG_BULLISH"
+            return "BULLISH"
+
+        # Bearish stack (Trend remains intact as long as price holds below the 50 EMA baseline)
+        if (e20 < e50) and (price < e50):
+            if s200 is not None and e50 < s200:
+                return "STRONG_BEARISH"
+            return "BEARISH"
+
+        return "SIDEWAYS"
+
+    def generate_regime_matrix(self, mtf_dataframes: dict) -> dict:
+        """
+        Evaluates market regime across all timeframes and returns a weighted macro score.
+
+        Args:
+            mtf_dataframes: dict mapping timeframe string → pd.DataFrame (OHLCV)
+                            e.g. {"1m": df_1m, "5m": df_5m, ..., "1d": df_1d}
+
+        Returns:
+            {
+              "matrix": {"1m": "BULLISH", "5m": "SIDEWAYS", ...},
+              "overall_macro_score": 0.42,   # -1.0 (full bear) to +1.0 (full bull)
+              "dominant_regime": "BULLISH",
+            }
+        """
+        matrix = {}
+        weighted_score = 0.0
+        total_weight   = 0.0
+
+        for tf in MTF_TIMEFRAMES:
+            df = mtf_dataframes.get(tf)
+            if df is None or df.empty:
+                matrix[tf] = "UNKNOWN"
+                continue
+
+            regime = self._classify_tf_regime(df)
+            matrix[tf] = regime
+
+            weight = MTF_WEIGHTS.get(tf, 0.10)
+            weighted_score += REGIME_SCORES[regime] * weight
+            total_weight   += weight
+
+        # Normalise to [-1.0, +1.0] even if some TFs were UNKNOWN (weight=0)
+        if total_weight > 0:
+            overall_macro_score = round(weighted_score / total_weight, 4)
+        else:
+            overall_macro_score = 0.0
+
+        # Determine dominant label
+        if overall_macro_score >= 0.5:
+            dominant = "STRONG_BULLISH"
+        elif overall_macro_score >= 0.15:
+            dominant = "BULLISH"
+        elif overall_macro_score <= -0.5:
+            dominant = "STRONG_BEARISH"
+        elif overall_macro_score <= -0.15:
+            dominant = "BEARISH"
+        else:
+            dominant = "SIDEWAYS"
+
+        return {
+            "matrix":               matrix,
+            "overall_macro_score":  overall_macro_score,
+            "dominant_regime":      dominant,
         }

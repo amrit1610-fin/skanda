@@ -1,0 +1,37 @@
+# .gitattributes — Skanda
+# Normalize line endings: LF in repo, CRLF on Windows checkout
+* text=auto
+
+# Python
+*.py    text eol=lf
+
+# Web
+*.js    text eol=lf
+*.jsx   text eol=lf
+*.ts    text eol=lf
+*.tsx   text eol=lf
+*.css   text eol=lf
+*.html  text eol=lf
+*.json  text eol=lf
+*.md    text eol=lf
+
+# Config
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.toml  text eol=lf
+.env*   text eol=lf
+
+# Binary — never diff or modify
+*.cbm        binary
+*.pt         binary
+*.pth        binary
+*.safetensors binary
+*.bin        binary
+*.png        binary
+*.jpg        binary
+*.jpeg       binary
+*.gif        binary
+*.ico        binary
+*.ttf        binary
+*.woff       binary
+*.woff2      binary

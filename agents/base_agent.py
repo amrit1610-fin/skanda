@@ -71,7 +71,15 @@ class ReActAgent:
 
     def act(self, action_name, action_data=None):
         """Executes an action and logs it."""
-        print(f"[{self.name}] Action: {action_name} | Data: {action_data}")
+        # Prevent printing massive DataFrames to console, which causes Pandas/Regex to crash
+        if isinstance(action_data, dict) and "ohlcv_data" in action_data:
+            print(f"[{self.name}] Action: {action_name} | Data: <MarketData Payload Omitted>")
+        else:
+            # Safely truncate long strings so the terminal doesn't lag
+            data_str = str(action_data)
+            if len(data_str) > 200:
+                data_str = data_str[:200] + " ... [TRUNCATED]"
+            print(f"[{self.name}] Action: {action_name} | Data: {data_str}")
         self._log_stream("action", f"Executed: {action_name}")
         return {"action": action_name, "data": action_data, "status": "executed"}
 
@@ -88,5 +96,5 @@ class ReActAgent:
             }
             with open(log_file, 'a', encoding='utf-8') as f:
                 f.write(json.dumps(payload) + "\n")
-        except Exception:
-            pass
+        except Exception as log_err:
+            print(f"[{self.name}] WARNING: Failed to write to agent_stream.log: {log_err}")

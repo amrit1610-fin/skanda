@@ -1,103 +1,273 @@
-# SKANDA
-## The Ultimate AI Quantitative Trading Engine
+<div align="center">
 
-An autonomous multi-agent quantitative stack: Python agents use a **ReAct** (reason + act) pattern, stream logs to the UI over WebSockets, and pair with a **React (Vite)** dashboard (pink / purple / black “Carbon Mint” theme).
+# ⚡ SKANDA
+### Autonomous Multi-Agent Quantitative Crypto Trading Bot
 
-## System architecture
+[![Python](https://img.shields.io/badge/Python-3.14-3776AB?style=flat-square&logo=python&logoColor=white)](https://python.org)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.110-009688?style=flat-square&logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react&logoColor=black)](https://react.dev)
+[![CCXT](https://img.shields.io/badge/CCXT-4.2-FF6B35?style=flat-square)](https://ccxt.com)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg?style=flat-square)](LICENSE)
 
-| Agent | Role |
-|--------|------|
-| **Data Engineer** | Loads policy from `config/active_policy.json`, fetches **10 USDT symbols in parallel** (mock OHLCV sized to the active timeframe), attaches macro placeholder context. Optional **ccxt** path in execution for live quotes. |
-| **Asset Manager** | **Lead–lag** analysis across the universe (BTC, ETH, SOL, XRP, LTC, AVAX, DOGE, DOT, LINK, ADA). Runs each cycle after the data panel is built (`identify_lead_lag`). |
-| **Sentiment Analyst** | FinBERT-style sentiment on news payload (GPU when available). |
-| **Quant Analyst** | Strategy tools in `strategies/` (EMA, RSI, Bollinger, trendline, MACD) driven by `.skills/quant_analyst/*.md`. |
-| **ML Engineer** | CatBoost win-probability / validation (CPU). |
-| **Risk Manager** | Deterministic veto + Mem0 memory for repeated vetoes (“strike” alert). |
-| **User Proxy** | Alerts and announcements. |
-| **Quant Trader** | Paper execution, wallet in `logs/account_balance.json`, fills in `logs/trade_history.json`. |
+</div>
 
-**Offline backtests:** `agents/backtest_agent.py` + `POST /api/run-backtest` (synthetic history, same strategy modules).
+---
 
-## API (`server.py`, FastAPI)
+**Skanda** is a production-grade autonomous trading system that deploys a council of five specialized ReAct AI agents — each with its own reasoning loop, memory, and skill set — to analyze macro market regimes, generate quantitative signals, and execute bracketed limit orders on Binance in real time. Unlike prompt-chaining demos, every agent in Skanda runs deterministic, auditable Python inference: FinBERT for live sentiment scoring, a CatBoost ML classifier for win-probability gating, and a weighted six-timeframe EMA/SMA regime classifier to prevent counter-trend execution.
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| GET | `/api/status` | Policy + `online`; includes `asset_manager` metadata. |
-| GET | `/api/logs` | Trade / risk events (normalized `symbol`, `side`). |
-| GET | `/api/analytics` | Metrics from **executed** trades only (vetoes excluded from win rate / Sharpe / curves). |
-| GET | `/api/balance` | Paper wallet. |
-| POST | `/api/switch-strategy` | Partial policy update. |
-| POST | `/api/update-config` | Full policy: `strategy`, `timeframe`, `interval_seconds`, `symbol`. |
-| POST | `/api/run-backtest` | Body: `symbol`, `strategy`, `timeframe`, `months`. |
-| WS | `/api/stream` | Tails `logs/agent_stream.log` (agent thoughts / actions). |
+---
 
-CORS allows local Vite (`5173`) and regex for other localhost ports.
+## 🏛️ Architecture at a Glance
 
-## Dependencies
-
-### Python
-
-Install from the project root:
-
-```bash
-python -m pip install -r requirements.txt
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                      React Dashboard (Vite)                      │
+│        WebSocket stream · REST analytics · Demo Mode fallback   │
+└────────────────────────┬────────────────────────────────────────┘
+                         │ ws://  +  http://
+┌────────────────────────▼────────────────────────────────────────┐
+│                    FastAPI Server (server.py)                    │
+│         WebSocket broadcast · REST endpoints · Lifespan          │
+└──┬────────────────────────────────────────────────────┬─────────┘
+   │ Trading Engine (engine.py)                         │ Analytics
+   ▼                                                    ▼
+┌─────────────────────────────────────┐     /api/logs · /api/analytics
+│          Agent Council              │     /api/balance · /api/status
+│                                     │
+│  1. DataEngineer  ──→  CCXT REST +  │
+│                        WS Klines    │
+│  2. MacroEconomist ──→ MTF Radar    │
+│                        (6 TFs)      │
+│  3. SentimentAnalyst → FinBERT NLP  │
+│  4. RiskManager   ──→ ML Veto Gate  │
+│  5. QuantTrader   ──→ Binance Order │
+└─────────────────────────────────────┘
+         │ Mainnet          │ Testnet
+    (real execution)  (paper trading)
 ```
 
-**Core libraries** (demo / API): `fastapi`, `uvicorn`, `websockets`, `pandas`, `numpy`, `ccxt`, `pandas-ta`, plus agents stack: `torch`, `transformers`, `catboost`, `mem0ai`, `sentence-transformers`, etc.
+---
 
-**Python version:** use **3.10–3.13** if `pip install -r requirements.txt` fails (e.g. CatBoost / Torch may not support the newest CPython yet). `pydantic` is pulled in by FastAPI.
+## ✨ Features
 
-### Frontend (`frontend/`)
+| Feature | Details |
+|---|---|
+| **Multi-Agent ReAct Council** | 5 specialized agents (DataEngineer, MacroEconomist, SentimentAnalyst, RiskManager, QuantTrader) each with their own reasoning loop, skill prompt, and Mem0 vector memory |
+| **MTF Regime Radar** | Classifies market regime across 6 timeframes (1m → 1d) using EMA20/EMA50/SMA200 alignment. Generates a weighted OVERALL_MACRO_SCORE ∈ [−1.0, +1.0] that vetoes counter-trend trades |
+| **FinBERT Sentiment Analysis** | Local ProsusAI/FinBERT inference (no external API calls) scoring each trading cycle. Feeds the ML gate as a real-time signal modifier |
+| **CatBoost ML Win-Probability Gate** | Trained on historical BTCUSDT feature set. Blocks execution unless predicted win probability ≥ 55% |
+| **Alpha Decay Veto** | Exponential freshness scoring (e^{-λt}) on each signal. Stale signals are automatically rejected before risk calculations |
+| **Dual-Exchange Routing** | Hot-swap between Binance Mainnet (live) and Binance Testnet (paper) via a single config flag — no code changes required |
+| **WebSocket Telemetry** | Real-time agent thought-stream broadcast from a tail-log async loop. Every agent `think()` and `act()` call appears live in the dashboard console |
+| **Vercel Demo Mode** | Frontend detects backend unavailability within 3.5s and seamlessly falls back to animated mock data — including a drifting MTF Regime Radar |
+| **Standalone CLI Backtester** | `run_backtest.py` fetches real Binance OHLCV directly into RAM via CCXT pagination and replays it through the identical engine logic |
+
+---
+
+## 🧱 Tech Stack
+
+### Backend (Python)
+| Layer | Technology |
+|---|---|
+| API Server | FastAPI 0.110 + Uvicorn (ASGI) |
+| WebSocket | FastAPI WebSocket + `websockets` 12 |
+| Exchange Broker | CCXT 4.2 (Binance REST + WebSocket klines) |
+| ML / NLP | CatBoost, PyTorch 2.9 (CPU), HuggingFace Transformers 5.7 |
+| NLP Model | ProsusAI/FinBERT (local inference) |
+| Agent Memory | Mem0ai + ChromaDB (local vector store) |
+| Quant Math | Pandas 2.1, NumPy 1.26, SciPy, statsmodels |
+| Technical Analysis | pandas-ta |
+| Secrets | python-dotenv |
+
+### Frontend (React / Vite)
+| Layer | Technology |
+|---|---|
+| Framework | React 18 + Vite |
+| Styling | Vanilla CSS (glassmorphism dark theme) |
+| Charts | Recharts |
+| Icons | Lucide React |
+| HTTP | Axios |
+| Real-time | Native browser WebSocket API |
+| Deployment | Vercel (with automatic Demo Mode fallback) |
+
+---
+
+## 🚀 Local Setup
+
+### Prerequisites
+- Python 3.11+ (tested on 3.14)
+- Node.js 18+
+- A Binance Testnet account ([register here](https://testnet.binance.vision/))
+
+### 1 · Clone & Python Environment
+
+```bash
+git clone https://github.com/YOUR_USERNAME/skanda.git
+cd skanda
+
+# Create and activate a virtual environment
+python -m venv venv
+# Windows:
+venv\Scripts\activate
+# macOS/Linux:
+source venv/bin/activate
+
+# Install all Python dependencies
+pip install -r requirements.txt
+```
+
+> **Note on PyTorch:** The `requirements.txt` installs the CPU-only build of PyTorch.  
+> For CUDA (GPU inference), replace the torch line with:
+> ```bash
+> pip install torch --index-url https://download.pytorch.org/whl/cu121
+> ```
+
+### 2 · Configure Environment Variables
+
+Create a `.env` file in the project root:
+
+```bash
+# .env — DO NOT COMMIT THIS FILE
+BINANCE_TESTNET_API_KEY=your_testnet_api_key_here
+BINANCE_TESTNET_API_SECRET=your_testnet_api_secret_here
+
+# Optional: Add real mainnet keys ONLY for live trading
+# BINANCE_API_KEY=your_mainnet_key
+# BINANCE_API_SECRET=your_mainnet_secret
+```
+
+> ⚠️ **Security:** `.env` is listed in `.gitignore` and will never be committed.  
+> Real mainnet keys are never required to run the system in paper-trading mode.
+
+### 3 · Install Frontend Dependencies
 
 ```bash
 cd frontend
 npm install
+cd ..
 ```
 
-Notable deps: **React 19**, **Vite**, **Tailwind 4**, **axios**, **lucide-react**, **recharts**.
+### 4 · Start the System (3-Terminal Boot Sequence)
 
-## Config & logs (demo readiness)
+Open **three separate terminals** from the project root:
 
-- **`config/active_policy.json`** — strategy, timeframe, `interval_seconds`, `symbol` (must be writable; engine hot-reloads each cycle).
-- **`logs/account_balance.json`** — seed **$10,000 USDT** for paper mode (writable).
-- **`logs/agent_stream.log`** — created/append-only for the WebSocket console.
-- **`logs/trade_history.json`** — created by agents if missing.
-
-`forward_test.py` imports **`AssetManager`** from `agents.asset_manager` and calls **`identify_lead_lag`** after each `fetch_market_data()`.
-
-## Launch sequence (three terminals)
-
-From **`c:\Users\kusha\Desktop\ai-trader`** (adjust path on your machine).
-
-**1 — Trading engine (live / forward-test loop)**
-
+**Terminal 1 — FastAPI Backend:**
 ```bash
-python forward_test.py
+cd skanda
+venv\Scripts\activate    # or source venv/bin/activate
+python server.py
+# Server will be live at: http://localhost:8000
 ```
 
-**2 — FastAPI bridge**
-
+**Terminal 2 — React Frontend:**
 ```bash
-python -m uvicorn server:app --reload --host 127.0.0.1 --port 8000
-```
-
-**3 — React dashboard**
-
-```bash
-cd frontend
+cd skanda/frontend
 npm run dev
+# Dashboard will be live at: http://localhost:5173
 ```
 
-Open the URL Vite prints (typically **http://localhost:5173**). The UI expects the API at **http://localhost:8000**.
+**Terminal 3 — Trading Engine (optional for paper trading):**
+```bash
+cd skanda
+venv\Scripts\activate
+python main.py
+# Boots the autonomous agent council and begins live paper trading
+```
 
-## Validating the Asset Manager
+### 5 · Optional: Run a Backtest from the CLI
 
-After starting the engine (and optionally the WebSocket UI):
+Edit the parameters at the bottom of `run_backtest.py`, then:
 
-1. **Console:** Each cycle prints **`[AssetManager] Thinking:`** followed by text like *Identifying lead–lag structure across 10 symbols*.
-2. **`logs/agent_stream.log`:** JSON lines with `"agent": "AssetManager"` and the same message; the dashboard **Agent Console** shows **`[AssetManager]`**.
-3. **Payload:** The returned structure includes **`symbols_used`** (up to 10) and **`top_pairs`** when overlap is sufficient; if data is thin, you may see a **`note`** instead.
+```bash
+python run_backtest.py
+# Fetches real Binance OHLCV directly into RAM — no CSV files needed
+```
 
 ---
 
-*This README reflects the architecture as of the multi-coin Asset Manager, analytics filters, backtest endpoint, and themed dashboard work.*
+## 🌐 Vercel Demo Mode
+
+The React frontend is **fully deployable to Vercel** as a static site.
+
+When the frontend cannot reach the backend WebSocket (i.e., when deployed without a running server), it automatically activates **Demo Mode** within 3.5 seconds:
+
+- All state is seeded from `src/utils/mockData.js` with realistic randomised values
+- The MTF Regime Radar updates every 4 seconds with drifting market data
+- A subtle amber badge — **"UI Demo Mode — Backend Engine Offline"** — appears in the top-right corner
+- No errors, no blank screens, no broken charts
+
+**Deploy to Vercel:**
+```bash
+cd frontend
+npx vercel --prod
+```
+
+---
+
+## 📁 Project Structure
+
+```
+skanda/
+├── server.py              # FastAPI ASGI server — WebSocket + REST API
+├── engine.py              # Universal trading loop (live & backtest)
+├── main.py                # Live bot entry point (autonomous loop)
+├── run_backtest.py        # Standalone CLI backtester
+├── requirements.txt       # Pinned Python dependencies
+│
+├── agents/                # ReAct AI Agent Council
+│   ├── base_agent.py      # ReActAgent base class (think/act/log)
+│   ├── data_engineer.py   # CCXT REST + WebSocket hybrid data faucet
+│   ├── macro_economist.py # GMM regime + MTF Regime Radar (6 timeframes)
+│   ├── sentiment_analyst.py # FinBERT local NLP inference
+│   ├── risk_manager.py    # 4-gate veto logic + Mem0 strike detection
+│   ├── quant_trader.py    # Binance order execution (mainnet/testnet)
+│   ├── backtest_agent.py  # Backtesting simulation engine
+│   ├── asset_manager.py   # Multi-coin universe + cointegration scanner
+│   ├── quant_analyst.py   # Signal generation + indicator calculations
+│   └── ensemble_manager.py # Multi-strategy signal aggregator
+│
+├── core_logic/            # Shared computation (used by all drivers)
+│   ├── strategies.py      # EMA 8/30, EMA 9/15, Trendline Break signals
+│   └── ml_inference.py    # CatBoost win-probability scoring
+│
+├── ml_pipeline/           # Model training scripts (offline, one-time)
+│   ├── 1_build_dataset.py # Feature engineering from OHLCV
+│   ├── 2_train_model.py   # XGBoost baseline trainer
+│   └── train_catboost.py  # CatBoost production trainer
+│
+├── config/
+│   └── active_policy.json # Hot-reloadable strategy/timeframe/symbol config
+│
+├── utils/                 # Shared utilities
+│   └── alpha_decay.py     # Exponential signal freshness scoring
+│
+├── docs/
+│   └── SKANDA_ARCHITECTURE.md  # Deep-dive technical documentation
+│
+└── frontend/              # React + Vite dashboard
+    └── src/
+        ├── App.jsx        # Root — WebSocket + Demo Mode fallback
+        ├── utils/mockData.js    # Realistic demo data generator
+        ├── components/
+        │   ├── DemoModeBadge.jsx # Amber "Demo Mode" indicator
+        │   ├── RegimeMatrix.jsx  # MTF Regime Radar visualizer
+        │   ├── AgentConsole.jsx  # Live agent thought-stream overlay
+        │   └── ...
+        └── pages/
+            ├── DashboardPage.jsx
+            ├── TradeLogPage.jsx
+            ├── BacktestPage.jsx
+            └── ...
+```
+
+---
+
+## ⚖️ Disclaimer
+
+Skanda is a research and portfolio project. It is **not financial advice**. Cryptocurrency trading carries significant risk of financial loss. Always use Testnet (paper trading) mode unless you fully understand the risks of live execution.
+
+---
+
+<div align="center">
+Built with ⚡ by Kusha &nbsp;|&nbsp; MIT License
+</div>

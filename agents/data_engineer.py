@@ -18,13 +18,15 @@ from .base_agent import ReActAgent
 from .asset_manager import UNIVERSE
 
 REAL_SYMBOL = "BTCUSDT"
-VALID_TIMEFRAMES = {"5m", "15m", "1h", "4h"}
+VALID_TIMEFRAMES = {"1m", "5m", "15m", "1h", "4h", "1d"}
 
 # Timeframe → default REST candle count (primary & multi-coin panels)
-TF_CANDLES = {"5m": 288, "15m": 96, "1h": 168, "4h": 90}
+TF_CCXT = {"1m": "1m", "5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h", "1d": "1d"}
+TF_CANDLES = {"1m": 250, "5m": 250, "15m": 250, "1h": 250, "4h": 250, "1d": 250}
 
-# CCXT interval string (Binance spot)
-TF_CCXT = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"}
+# Multi-Timeframe Regime Radar — timeframes fetched every live cycle
+MTF_TIMEFRAMES = ["1m", "5m", "15m", "1h", "4h", "1d"]
+MTF_CANDLES    = 250  # 250 bars per TF is enough for EMA20/50/SMA200
 
 # Binance combined stream kline suffix
 TF_BINANCE_WS = {"5m": "5m", "15m": "15m", "1h": "1h", "4h": "4h"}
@@ -34,28 +36,6 @@ BINANCE_WS_BASE = "wss://stream.binance.com:9443/ws"
 _DEFAULT_WARMUP_LIMIT = 500
 _CANDLE_DEQUE_MAX = 5000
 _RECONNECT_BACKOFF_MAX = 60.0
-
-
-def _mock_ohlcv_for_symbol(symbol: str, n_candles: int, timeframe: str) -> pd.DataFrame:
-    """Deterministic-per-symbol mock OHLCV (fallback for offline / CCXT failure)."""
-    seed = int(hashlib.sha256(f"{symbol}:{timeframe}:{n_candles}".encode()).hexdigest()[:8], 16) % (2**31)
-    rng = np.random.default_rng(seed)
-
-    base_price = 20000.0 + (seed % 50000) / 10.0
-    pct_moves = rng.normal(0, 0.008, n_candles)
-    closes = base_price * np.cumprod(1 + pct_moves)
-    ts_base = int(time.time() * 1000) - n_candles * 60_000
-    timestamps = [ts_base + i * 60_000 for i in range(n_candles)]
-
-    return pd.DataFrame({
-        "timestamp": timestamps,
-        "open": closes * (1 + rng.uniform(-0.002, 0.002, n_candles)),
-        "high": closes * (1 + np.abs(rng.normal(0, 0.004, n_candles))),
-        "low": closes * (1 - np.abs(rng.normal(0, 0.004, n_candles))),
-        "close": closes,
-        "volume": rng.integers(500, 5000, n_candles).astype(float),
-    })
-
 
 def _to_ccxt_symbol(symbol: str) -> str:
     s = (symbol or REAL_SYMBOL).strip().upper().replace("/", "").replace("-", "")
@@ -90,12 +70,14 @@ def _rows_to_dataframe(rows: list[dict], partial: Optional[dict]) -> pd.DataFram
 class DataEngineer(ReActAgent):
     """
     Hybrid market data: CCXT REST warm-up + Binance public WebSocket kline stream.
-    Output schema: timestamp (Unix ms), open, high, low, close, volume.
+    Upgraded for WOTA Architecture (Live & Backtest Mode).
     """
 
     def __init__(self):
         skill_path = os.path.join(os.path.dirname(__file__), "..", ".skills", "data_engineer", "system_prompt.md")
         super().__init__("DataEngineer", skill_path)
+        
+        # Live Stream State
         self._lock = threading.RLock()
         self._candles: deque[dict[str, Any]] = deque(maxlen=_CANDLE_DEQUE_MAX)
         self._partial: Optional[dict[str, Any]] = None
@@ -104,6 +86,11 @@ class DataEngineer(ReActAgent):
         self._live_symbol: Optional[str] = None
         self._live_timeframe: Optional[str] = None
         self._stream_stop = threading.Event()
+        
+        # WOTA Backtest Time Machine State
+        self.historical_dfs = {} # dict of symbol -> pd.DataFrame
+        self.current_step = 0
+        self.lookback_window = 250 # Ensure 200 EMA can calculate
 
     def _read_policy(self) -> dict:
         try:
@@ -125,11 +112,9 @@ class DataEngineer(ReActAgent):
             self._exchange = ccxt.binance({"enableRateLimit": True})
         return self._exchange
 
+    # --- Live CCXT & WebSocket Logic ---
+
     def get_historical_ohlcv(self, symbol: str, timeframe: str, limit: int) -> pd.DataFrame:
-        """
-        Fetch historical OHLCV via CCXT (Binance). Returns columns:
-        timestamp, open, high, low, close, volume (timestamp = Unix milliseconds).
-        """
         tf = timeframe if timeframe in VALID_TIMEFRAMES else "5m"
         ccxt_tf = TF_CCXT.get(tf, "5m")
         pair = _to_ccxt_symbol(symbol)
@@ -137,7 +122,6 @@ class DataEngineer(ReActAgent):
 
         try:
             ex = self._get_exchange()
-            # Dynamic since: count backward from now based on candle duration
             tf_ms_map = {
                 "1m": 60_000, "3m": 180_000, "5m": 300_000,
                 "15m": 900_000, "30m": 1_800_000, "1h": 3_600_000,
@@ -148,13 +132,11 @@ class DataEngineer(ReActAgent):
             raw = ex.fetch_ohlcv(pair, timeframe=ccxt_tf, limit=lim, since=since)
         except Exception as e:
             self.think(f"CCXT fetch_ohlcv failed for {pair} {ccxt_tf}: {e}. Using mock fallback.")
-            n = TF_CANDLES.get(tf, 288)
-            return _mock_ohlcv_for_symbol(symbol, min(n, lim), tf)
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
         if not raw:
             self.think(f"Empty OHLCV from exchange for {pair}; using mock fallback.")
-            n = TF_CANDLES.get(tf, 288)
-            return _mock_ohlcv_for_symbol(symbol, min(n, lim), tf)
+            return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
         rows = []
         for t, o, h, l, c, v in raw:
@@ -174,7 +156,6 @@ class DataEngineer(ReActAgent):
         timeframe: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> None:
-        """Load REST history into the thread-safe buffer (call before live stream)."""
         sym = symbol or self._get_active_symbol()
         tf = timeframe or self._get_timeframe()
         lim = int(limit) if limit is not None else self._warmup_limit
@@ -194,10 +175,6 @@ class DataEngineer(ReActAgent):
         self.think(f"Warm-up loaded {len(df)} candles for {sym} @ {tf}.")
 
     def get_latest_market_state(self) -> pd.DataFrame:
-        """
-        Merge completed historical buffer with the current in-flight kline for a seamless OHLCV DataFrame.
-        Columns: timestamp, open, high, low, close, volume (timestamp = Unix ms).
-        """
         with self._lock:
             rows = list(self._candles)
             partial = dict(self._partial) if self._partial is not None else None
@@ -238,10 +215,6 @@ class DataEngineer(ReActAgent):
         return f"{BINANCE_WS_BASE}/{stream_sym}@kline_{interval}"
 
     async def start_live_stream(self, symbol: str) -> None:
-        """
-        Connect to Binance public WebSocket kline stream; update buffer with live OHLCV.
-        Automatic reconnection with exponential backoff.
-        """
         self._live_symbol = symbol
         self._live_timeframe = self._get_timeframe()
         backoff = 1.0
@@ -286,38 +259,77 @@ class DataEngineer(ReActAgent):
         df = self.get_historical_ohlcv(symbol, timeframe, n_candles)
         return symbol, df
 
+    def _fetch_mtf_data(self, symbol: str) -> dict:
+        """
+        Fetches 250 candles for each MTF_TIMEFRAME in parallel.
+        Gracefully returns an empty DataFrame for any TF that fails.
+        """
+        results: dict[str, pd.DataFrame] = {}
+
+        def _fetch_one_tf(tf: str):
+            try:
+                return tf, self.get_historical_ohlcv(symbol, tf, MTF_CANDLES)
+            except Exception as exc:
+                self.think(f"MTF fetch failed for {symbol} @ {tf}: {exc}")
+                return tf, pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+
+        with ThreadPoolExecutor(max_workers=len(MTF_TIMEFRAMES)) as pool:
+            futures = {pool.submit(_fetch_one_tf, tf): tf for tf in MTF_TIMEFRAMES}
+            for fut in as_completed(futures):
+                tf, df = fut.result()
+                results[tf] = df
+
+        return results
+
+    # --- Dual Mode Execution ---
+
     def fetch_market_data(self):
-        """Primary symbol: hybrid buffer; universe peers: REST-only historical panels."""
+        """
+        The Universal Faucet.
+        Fetches the latest live market data from CCXT and WebSockets.
+        """
         symbol = self._get_active_symbol()
         timeframe = self._get_timeframe()
-        n_candles = TF_CANDLES.get(timeframe, 288)
 
+        n_candles = TF_CANDLES.get(timeframe, 288)
         primary_df = self.get_latest_market_state()
+        
         if primary_df.empty:
             self.think("Hybrid buffer empty; refreshing from REST for primary.")
             primary_df = self.get_historical_ohlcv(symbol, timeframe, max(n_candles, self._warmup_limit))
 
-        self.think(
-            f"Market state: primary {symbol} ({len(primary_df)} rows hybrid), "
-            f"fetching REST panels for {len(UNIVERSE)} symbols @ {timeframe}."
-        )
+            if primary_df.empty:
+                raise RuntimeError(f"CRITICAL API FAILURE: Could not fetch data for {symbol}. Halting trading cycle.")
 
+        # 1. Single-Coin Focus (Saves API Limits)
+        self.think(f"Market state: primary {symbol} ({len(primary_df)} rows hybrid).")
         ohlcv_by_symbol: dict[str, pd.DataFrame] = {symbol: primary_df}
-        others = [s for s in UNIVERSE if s != symbol]
-        with ThreadPoolExecutor(max_workers=min(10, len(others) + 1)) as ex:
-            futures = {
-                ex.submit(self._fetch_one_symbol_historical, sym, n_candles, timeframe): sym
-                for sym in others
-            }
-            for fut in as_completed(futures):
-                sym, df = fut.result()
-                ohlcv_by_symbol[sym] = df
+
+        # 2. MTF Regime Radar Fetch (Parallelized)
+        mtf_timeframes = ["1m", "5m", "15m", "1h", "4h", "1d"]
+        mtf_dataframes = {}
+        
+        self.think("Fetching MTF data for Regime Radar in parallel...")
+        import concurrent.futures
+        import random
+
+        def fetch_tf(tf):
+            # A tiny random jitter (0-50ms) to prevent absolute simultaneous hits on Binance
+            time.sleep(random.uniform(0.0, 0.05)) 
+            return tf, self.get_historical_ohlcv(symbol, tf, limit=250)
+
+        # Blast out all 6 network requests simultaneously
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as executor:
+            results = executor.map(fetch_tf, mtf_timeframes)
+            for tf, df_mtf in results:
+                mtf_dataframes[tf] = df_mtf
 
         macro_news = {
             "summary": "Hybrid feed: CCXT REST warm-up + Binance WebSocket klines.",
             "sentiment": "neutral",
         }
 
+        # 3. Build the Payload
         standard_payload = {
             "symbol": symbol,
             "exchange": "binance",
@@ -326,26 +338,21 @@ class DataEngineer(ReActAgent):
             "ohlcv_by_symbol": ohlcv_by_symbol,
             "universe": UNIVERSE,
             "macro_news": macro_news,
+            "mtf_data": mtf_dataframes  # 🚨 This is what engine.py is looking for!
         }
 
         return self.act("fetch_market_data", standard_payload)
 
+
     def fetch_pairs_data(self, symbol_a: str, symbol_b: str, timeframe: str, limit: int) -> pd.DataFrame:
-        """
-        Fetch historical OHLCV for two symbols and merge them for pairs trading analysis.
-        Calculates the spread_ratio as close_A / close_B.
-        """
         df_a = self.get_historical_ohlcv(symbol_a, timeframe, limit)
         df_b = self.get_historical_ohlcv(symbol_b, timeframe, limit)
 
-        # Prefix columns except timestamp
         df_a = df_a.rename(columns={col: f"{col}_A" for col in df_a.columns if col != "timestamp"})
         df_b = df_b.rename(columns={col: f"{col}_B" for col in df_b.columns if col != "timestamp"})
 
-        # Inner join on timestamp to ensure exact temporal alignment
         merged = pd.merge(df_a, df_b, on="timestamp", how="inner")
 
-        # Calculate spread ratio
         if 'close_A' in merged.columns and 'close_B' in merged.columns:
             merged['spread_ratio'] = merged['close_A'] / merged['close_B']
 

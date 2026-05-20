@@ -29,6 +29,7 @@ const STRATEGIES = [
   { value: 'ema_8_30', label: '8/30 EMA Momentum (Wizard)' },
   { value: 'ema_9_15', label: '9/15 EMA Scalping (Trade Room)' },
   { value: 'trendline_break', label: 'Multi-TF Trendline Break (Tori)' },
+  { value: 'ensemble_alpha', label: 'Ensemble Alpha' },
 ];
 
 const TIMEFRAMES = [
@@ -188,6 +189,11 @@ function BacktestPage() {
                 <option key={s.value} value={s.value}>{s.label}</option>
               ))}
             </select>
+            {strategy === 'ensemble_alpha' && (
+              <div style={{ marginTop: 8, fontSize: '0.75rem', color: THEME.accent, background: 'rgba(160, 32, 240, 0.1)', padding: '6px 10px', borderRadius: 6, border: `1px solid rgba(160, 32, 240, 0.3)` }}>
+                Ensemble Alpha is optimized for <strong>15m resolution</strong> to ensure higher-timeframe filters have enough data points.
+              </div>
+            )}
           </div>
 
           <div className="settings-group">

@@ -2,6 +2,7 @@ import os
 import json
 import time
 import torch
+import random
 from datetime import datetime
 from mem0 import Memory
 from .base_agent import ReActAgent
@@ -17,18 +18,20 @@ class RiskManager(ReActAgent):
         # Initialize Mem0 with local HuggingFace embeddings
         self.think("Initializing Mem0 memory layer with local huggingface embeddings...")
         
+        base_dir = os.path.dirname(__file__)
+        db_path = os.path.abspath(os.path.join(base_dir, '..', 'data', 'risk_memory'))
+        os.makedirs(db_path, exist_ok=True)
         config = {
             "vector_store": {
                 "provider": "chroma",
                 "config": {
-                    "path": os.path.join(os.path.dirname(__file__), '..', 'logs', 'mem0_db')
+                    "collection_name": "risk_memory",
+                    "path": db_path
                 }
             },
             "embedder": {
                 "provider": "huggingface",
-                "config": {
-                    "model": "sentence-transformers/all-MiniLM-L6-v2"
-                }
+                "config": {"model": "sentence-transformers/all-MiniLM-L6-v2"}
             }
         }
         
@@ -37,7 +40,6 @@ class RiskManager(ReActAgent):
             self.think("Mem0 initialized successfully.")
         except Exception as e:
             self.think(f"Warning: Mem0 initialization failed: {e}")
-            self.memory = None
 
     def _ensure_log_file(self):
         os.makedirs(os.path.dirname(self.log_file), exist_ok=True)
@@ -155,8 +157,17 @@ class RiskManager(ReActAgent):
                 event["pair_p_value"] = pair_p_value
         history.append(event)
 
-        with open(self.log_file, 'w') as f:
-            json.dump(history, f, indent=4)
+        # Safe Write Loop to prevent JSON corruption
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with open(self.log_file, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, indent=4)
+                break # Success, exit the loop
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"[RiskManager] Failed to write to trade_history.json after 5 attempts: {e}")
+                time.sleep(random.uniform(0.1, 0.5))
 
     def evaluate_trade(self, trade_proposal, ml_validation):
         self.think(f"Evaluating trade proposal and ML validation...")
@@ -189,28 +200,45 @@ class RiskManager(ReActAgent):
             reason = "Alpha Expired - Signal Stale"
 
         if not alpha_veto:
-            # Decision Logic: Veto if ML probability < 55% or Signal is HOLD
-            if win_prob < 55.0 or ml_action == "HOLD" or signal_type == "HOLD":
+            # ── Macro Trend Veto (MTF Regime Radar) ──────────────────────────
+            # Guards against trading into a dominant opposing macro trend.
+            macro_score = float(trade_proposal.get("macro_score", 0.0))
+            macro_veto  = False
+
+            if signal_type == "BUY" and macro_score < -0.5:
+                macro_veto = True
                 status = "vetoed"
-                reason = f"ML Win Probability is {win_prob}% (< 55%)" if win_prob < 55.0 else "Signal is HOLD"
-                
-                # Store in Mem0
-                self.think(f"Vetoing trade. Storing failure memory for strategy: {strategy_used}")
-                memory_text = f"Strategy '{strategy_used}' was vetoed due to {reason}."
-                
-                if self.memory:
-                    try:
-                        self.memory.add(memory_text, user_id="risk_manager")
-                        
-                        # Search recent memories
-                        recent_memories = self.memory.search(f"Strategy '{strategy_used}' was vetoed", user_id="risk_manager", limit=5)
-                        veto_count = sum(1 for m in recent_memories if strategy_used in m.get('memory', ''))
-                        
-                        if veto_count >= 3:
-                            self.think(f"ALERT: Strategy {strategy_used} has failed {veto_count} times recently.")
-                            strike_alert = True
-                    except Exception as e:
-                        self.think(f"Error interacting with Mem0: {e}")
+                reason = f"Fighting Macro Bear Trend (score={macro_score:.2f})"
+                self.think(f"[MacroVeto] BUY rejected — macro score {macro_score:.2f} heavily bearish.")
+
+            elif signal_type == "SELL" and macro_score > 0.5:
+                macro_veto = True
+                status = "vetoed"
+                reason = f"Fighting Macro Bull Trend (score={macro_score:.2f})"
+                self.think(f"[MacroVeto] SELL rejected — macro score {macro_score:.2f} heavily bullish.")
+
+            if not macro_veto:
+                # Decision Logic: Veto if ML probability < 55% or Signal is HOLD
+                if win_prob < 55.0 or ml_action == "HOLD" or signal_type == "HOLD":
+                    status = "vetoed"
+                    reason = f"ML Win Probability is {win_prob}% (< 55%)" if win_prob < 55.0 else "Signal is HOLD"
+
+                # Store veto in Mem0
+                if status == "vetoed":
+                    self.think(f"Vetoing trade. Storing failure memory for strategy: {strategy_used}")
+                    memory_text = f"Strategy '{strategy_used}' was vetoed due to {reason}."
+                    if self.memory:
+                        try:
+                            self.memory.add(memory_text, user_id="risk_manager")
+                            # Search recent memories for strike detection
+                            recent_memories = self.memory.search(f"Strategy '{strategy_used}' was vetoed", user_id="risk_manager", limit=5)
+                            veto_count = sum(1 for m in recent_memories if strategy_used in m.get('memory', ''))
+                            if veto_count >= 3:
+                                self.think(f"ALERT: Strategy {strategy_used} has failed {veto_count} times recently.")
+                                strike_alert = True
+                        except Exception as e:
+                            self.think(f"Error interacting with Mem0: {e}")
+
         
         pz = trade_proposal.get("pair_z_score")
         pp = trade_proposal.get("pair_p_value")
@@ -231,9 +259,32 @@ class RiskManager(ReActAgent):
         )
         
         return self.act("evaluate_risk", {
-            "status": status, 
-            "reason": reason, 
+            "status": status,
+            "reason": reason,
             "strike_alert": strike_alert,
             "failed_strategy": strategy_used,
             "decay_factor": decay_factor,
         })
+
+    def process_proposal(self, trade_proposal: dict) -> bool:
+        """
+        WOTA Bridge Method — called by engine.py's run_trading_cycle().
+
+        The engine computes win_probability directly via SkandaInferenceEngine
+        and embeds it in trade_proposal. This method synthesises the ml_validation
+        dict that evaluate_trade() expects, then returns a simple bool so the
+        engine can write:
+            if agents['risk'].process_proposal(trade_proposal): ...
+        """
+        win_prob = float(trade_proposal.get("win_probability", 0.0))
+        signal   = trade_proposal.get("signal_type", "HOLD").upper()
+
+        # Synthesise the ml_validation dict from what the engine already computed
+        ml_validation = {
+            "win_probability":    win_prob,
+            "recommended_action": "HOLD" if win_prob < 55.0 or signal == "HOLD" else signal,
+        }
+
+        result = self.evaluate_trade(trade_proposal, ml_validation)
+        status = result.get("data", {}).get("status", "vetoed")
+        return status == "approved"

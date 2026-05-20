@@ -7,6 +7,7 @@ import os
 os.environ['OMP_NUM_THREADS'] = '2'
 import asyncio
 import copy
+import ccxt
 import numpy as np
 import pandas as pd
 import uvicorn
@@ -14,11 +15,14 @@ from typing import List, Dict
 from collections import defaultdict
 from datetime import datetime, timezone
 
-from agents.backtest_agent import run_backtest
 from agents.asset_manager import UNIVERSE as MULTI_COIN_UNIVERSE
 from agents.data_engineer import DataEngineer
 from agents.macro_economist import MacroEconomist
 from utils.account_manager import AccountManager
+from agents.quant_trader import QuantTrader
+from agents.risk_manager import RiskManager
+from agents.backtest_agent import run_backtest
+from engine import run_trading_cycle
 
 ACCOUNT_MANAGER = AccountManager()
 SYSTEM_CONFIG = {"is_paper_trading": True}
@@ -42,6 +46,43 @@ def _read_startup_policy() -> dict:
             "symbol": "BTCUSDT",
         }
 
+def format_for_delta(symbol: str) -> str:
+    """
+    Ensures any symbol (e.g., BTCUSDT) is converted 
+    to Delta's strict 'BASE/QUOTE:SETTLE' format.
+    """
+    if not symbol:
+        return "BTC/USDT:USDT"
+    s = str(symbol).upper().replace("/", "").replace("-", "")
+    # If it's already in Delta format (has a colon), return as is
+    if ":" in s: 
+        return s
+    # Standardize Binance-style strings to Delta format
+    if s.endswith("USDT"):
+        base = s[:-4]
+        return f"{base}/USDT:USDT"  
+    # Fallback for other formats
+    return f"{s}/USDT:USDT"
+
+def _latest_signal_decay_from_logs():
+    """Most recent decay_factor from trade_history (risk + execution rows) for dashboard freshness."""
+    log_path = os.path.join(BASE_DIR, 'logs', 'trade_history.json')
+    try:
+        with open(log_path, 'r', encoding='utf-8') as f:
+            content = f.read().strip()
+        if not content:
+            return None
+        logs = json.loads(content)
+        if not logs:
+            return None
+        for e in sorted(logs, key=lambda x: x.get("timestamp") or "", reverse=True):
+            v = e.get("decay_factor")
+            if v is not None:
+                return float(v)
+        return None
+    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -64,13 +105,16 @@ async def lifespan(app: FastAPI):
         if train_df.empty or len(train_df) < 80:
             DATA_ENGINEER.warm_up_historical(sym, tf, limit=800)
             train_df = DATA_ENGINEER.get_latest_market_state()
-        MACRO_ECONOMIST.train_model(train_df)
+            
+        # PRO FIX: Only train if we actually have real data. 
+        if not train_df.empty:
+            MACRO_ECONOMIST.train_model(train_df)
+        else:
+            print("[Warning] Warm-up yielded empty data. MacroEconomist waiting for live ticks.")
+            
     except Exception as e:
         print(f"MacroEconomist training on live warm-up failed: {e}")
-        try:
-            MACRO_ECONOMIST.train_model(_bootstrap_macro_training_df(700))
-        except Exception as e2:
-            print(f"MacroEconomist synthetic bootstrap failed: {e2}")
+        # Completely removed the synthetic bootstrap fallback from here!
 
     _stream_task = asyncio.create_task(DATA_ENGINEER.start_live_stream(sym))
     asyncio.create_task(tail_log_file())
@@ -83,8 +127,7 @@ async def lifespan(app: FastAPI):
         try:
             await _stream_task
         except asyncio.CancelledError:
-            pass
-
+            print("[System] Background live stream task terminated gracefully.")
 
 app = FastAPI(title="AI Trader Backend API", lifespan=lifespan)
 
@@ -105,27 +148,10 @@ app.add_middleware(
 )
 
 REGIME_STRATEGY_MAP = {
-    0: "Multi-TF Trendline Break",
-    1: "8/30 EMA Momentum",
-    2: "9/15 EMA Scalping",
+    0: "trendline_break",
+    1: "ema_8_30",
+    2: "ema_9_15",
 }
-
-
-def _bootstrap_macro_training_df(rows: int = 500) -> pd.DataFrame:
-    rng = np.random.default_rng(7)
-    price = 30000.0
-    closes = []
-    for i in range(rows):
-        # Piecewise synthetic behavior to ensure all 3 clusters are represented.
-        if i < rows // 3:
-            shock = rng.normal(0.0, 0.0025)
-        elif i < (2 * rows) // 3:
-            shock = 0.0015 + rng.normal(0.0, 0.003)
-        else:
-            shock = rng.normal(0.0, 0.012)
-        price = max(100.0, price * (1.0 + shock))
-        closes.append(price)
-    return pd.DataFrame({"close": closes})
 
 
 def _compute_economist_data() -> dict:
@@ -144,11 +170,11 @@ def _compute_economist_data() -> dict:
                 if content:
                     logs = json.loads(content)
                     prices = [x.get("entry_price") for x in logs if x.get("entry_price") is not None]
-                    price_df = pd.DataFrame({"close": prices[-240:]}) if prices else _bootstrap_macro_training_df(240)
+                    price_df = pd.DataFrame({"close": prices[-240:]}) if prices else pd.DataFrame(columns=["close"])
                 else:
-                    price_df = _bootstrap_macro_training_df(240)
+                    price_df = pd.DataFrame(columns=["close"])
             else:
-                price_df = _bootstrap_macro_training_df(240)
+                price_df = pd.DataFrame(columns=["close"])
 
         detection = MACRO_ECONOMIST.detect_current_regime(price_df)
     except Exception:
@@ -159,32 +185,31 @@ def _compute_economist_data() -> dict:
         }
 
     regime_id = int(detection.get("regime_id", 0))
+
+    # ── MTF Regime Radar ─────────────────────────────────────────────────────
+    # Fetch 6 timeframes in parallel and run the MA-stack classifier.
+    # This data is merged into economist_data and broadcast over the WebSocket.
+    mtf_result = {"matrix": {}, "overall_macro_score": 0.0, "dominant_regime": "UNKNOWN"}
+    if DATA_ENGINEER is not None:
+        try:
+            policy = DATA_ENGINEER._read_policy()
+            sym = policy.get("symbol", "BTCUSDT")
+            mtf_dfs = DATA_ENGINEER._fetch_mtf_data(sym)
+            mtf_result = MACRO_ECONOMIST.generate_regime_matrix(mtf_dfs)
+        except Exception as mtf_err:
+            print(f"[MTF] Regime radar broadcast failed: {mtf_err}")
+
     return {
-        "regime_id": regime_id,
-        "regime_name": detection.get("regime_name", "Sideways / Mean Reversion"),
-        "confidence_pct": float(round(float(detection.get("confidence_pct", 0.0)), 2)),
-        "active_strategy": REGIME_STRATEGY_MAP.get(regime_id, "8/30 EMA Momentum"),
+        "regime_id":           regime_id,
+        "regime_name":         detection.get("regime_name", "Sideways / Mean Reversion"),
+        "confidence_pct":      float(round(float(detection.get("confidence_pct", 0.0)), 2)),
+        "active_strategy":     REGIME_STRATEGY_MAP.get(regime_id, "8/30 EMA Momentum"),
+        # MTF fields — consumed by React RegimeMatrix card
+        "mtf_matrix":          mtf_result.get("matrix", {}),
+        "overall_macro_score": round(float(mtf_result.get("overall_macro_score", 0.0)), 4),
+        "dominant_regime":     mtf_result.get("dominant_regime", "SIDEWAYS"),
     }
 
-
-def _latest_signal_decay_from_logs():
-    """Most recent decay_factor from trade_history (risk + execution rows) for dashboard freshness."""
-    log_path = os.path.join(BASE_DIR, 'logs', 'trade_history.json')
-    try:
-        with open(log_path, 'r', encoding='utf-8') as f:
-            content = f.read().strip()
-        if not content:
-            return None
-        logs = json.loads(content)
-        if not logs:
-            return None
-        for e in sorted(logs, key=lambda x: x.get("timestamp") or "", reverse=True):
-            v = e.get("decay_factor")
-            if v is not None:
-                return float(v)
-        return None
-    except (FileNotFoundError, json.JSONDecodeError, TypeError, ValueError):
-        return None
 
 
 # --- Pydantic Schemas ---
@@ -192,7 +217,7 @@ class StrategySwitchRequest(BaseModel):
     strategy: str
     interval_seconds: int = Field(default=3600, ge=60)
 
-VALID_TIMEFRAMES = frozenset({"5m", "15m", "1h", "4h"})
+VALID_TIMEFRAMES = frozenset({"1m", "5m", "15m", "1h", "4h", "1d"})
 
 
 class UpdateConfigRequest(BaseModel):
@@ -225,6 +250,78 @@ class BacktestRequest(BaseModel):
     def norm_sym(cls, v: str) -> str:
         s = (v or "BTCUSDT").strip().upper().replace("/", "")
         return s if s.endswith("USDT") else f"{s}USDT"
+
+
+def fetch_memory_ohlcv(symbol: str, timeframe: str, months: int) -> pd.DataFrame:
+    """Fetches Binance data directly into memory for the UI backtester."""
+    print(f"[*] API fetching {months} months of {timeframe} data for {symbol} via CCXT...")
+    exchange = ccxt.binance({'enableRateLimit': True})
+    
+    days = months * 30
+    mapping = {"5m": days * 24 * 12, "15m": days * 24 * 4, "1h": days * 24, "4h": days * 6}
+    n_bars = mapping.get(timeframe, days * 24)
+    
+    all_ohlcv = []
+    limit = 1000
+    tf_ms_map = {"5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000}
+    ms_per_candle = tf_ms_map.get(timeframe, 3600000)
+    since = exchange.milliseconds() - (n_bars * ms_per_candle)
+    ccxt_sym = symbol.replace("USDT", "/USDT") if "USDT" in symbol and "/" not in symbol else symbol
+    
+    while len(all_ohlcv) < n_bars:
+        try:
+            bars = exchange.fetch_ohlcv(ccxt_sym, timeframe, since=since, limit=limit)
+            if not bars: break
+            all_ohlcv.extend(bars)
+            since = bars[-1][0] + 1
+        except Exception as e:
+            print(f"[!] CCXT Fetch Error: {e}")
+            break
+
+    df = pd.DataFrame(all_ohlcv[-n_bars:], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    return df
+
+def run_wota_backtest(symbol: str, strategy: str, timeframe: str, months: int):
+    """
+    Executes the WOTA backtest by streaming CCXT memory data through the agents.
+    """
+    # 1. Setup Agents
+    data_agent = DataEngineer()
+    trader_agent = QuantTrader()
+    risk_agent = RiskManager()
+    
+    # 2. Fetch Data Dynamically
+    full_df = fetch_memory_ohlcv(symbol, timeframe, months)
+    if full_df.empty:
+        return {"ok": False, "error": f"Failed to download historical data for {symbol} from Binance."}
+        
+    # 3. Prime the Time Machine
+    data_agent.load_backtest_data({symbol: full_df})
+    
+    # 4. Prepare Mock Environment
+    agents = {
+        'data': data_agent,
+        'trader': trader_agent,
+        'risk': risk_agent,
+        'sentiment': None # Bypassed in backtest to save API costs
+    }
+    
+    # PRO FIX: Dynamically patch the policy so it doesn't try to call missing functions
+    data_agent._read_policy = lambda: {"strategy": strategy, "timeframe": timeframe, "symbol": symbol}
+    
+    # 5. Execution Loop
+    try:
+        from engine import run_trading_cycle
+        while True:
+            run_trading_cycle(agents, mode="backtest")
+    except StopIteration:
+        pass # Backtest finished successfully
+        
+    # 6. Retrieve Results
+    logs = trader_agent.get_backtest_logs() if hasattr(trader_agent, 'get_backtest_logs') else []
+    return _compute_strategy_metrics(logs)
+
 
 class ToggleModeRequest(BaseModel):
     is_paper: bool
@@ -259,67 +356,67 @@ async def tail_log_file():
         with open(log_file, 'w') as f:
             pass
 
-    try:
-        with open(log_file, "r", encoding="utf-8") as f:
-            f.seek(0, 2)
-            while True:
-                line = f.readline()
-                if not line:
-                    await asyncio.sleep(0.5)
-                    continue
-                payload = {"type": "stream", "economist_data": _compute_economist_data()}
-                try:
-                    payload["event"] = json.loads(line.strip())
-                except json.JSONDecodeError:
-                    payload["event"] = {
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "agent": "system",
-                        "type": "info",
-                        "message": line.strip(),
-                    }
-                await manager.broadcast(json.dumps(payload))
-    except Exception as e:
-        print(f"File tailing error: {e}")
+    # The Immortal Retry Loop
+    while True:
+        try:
+            with open(log_file, "r", encoding="utf-8") as f:
+                f.seek(0, 2)
+                while True:
+                    line = f.readline()
+                    if not line:
+                        await asyncio.sleep(0.5)
+                        continue
+                    payload = {"type": "stream", "economist_data": _compute_economist_data()}
+                    try:
+                        payload["event"] = json.loads(line.strip())
+                    except json.JSONDecodeError:
+                        payload["event"] = {
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "agent": "system",
+                            "type": "info",
+                            "message": line.strip(),
+                        }
+                    await manager.broadcast(json.dumps(payload))
+                    
+        except Exception as e:
+            print(f"[!] File tailing error: {e}. Restarting stream in 5 seconds...")
+            await asyncio.sleep(5) # Wait, then loop back to the top and try again
 
 # --- REST Endpoints ---
 
 @app.get("/api/status")
 def get_status():
-    """Returns active policy config. Always returns 200 so the frontend can detect the backend is alive."""
+    """
+    Returns the active system configuration and real-time alpha metrics.
+    Used by the frontend to sync settings and the dashboard 'Freshness' card.
+    """
     config_path = os.path.join(BASE_DIR, 'config', 'active_policy.json')
+    
+    # 1. Load the current policy
     try:
-        with open(config_path, 'r') as f:
+        with open(config_path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            data["online"] = True
-            # Ensure timeframe always present
-            if "timeframe" not in data:
-                data["timeframe"] = "5m"
-            if "alpha_half_life_seconds" not in data:
-                data["alpha_half_life_seconds"] = 300
-            if "alpha_decay_veto_threshold" not in data:
-                data["alpha_decay_veto_threshold"] = 0.5
-            latest_decay = _latest_signal_decay_from_logs()
-            if latest_decay is not None:
-                data["latest_signal_decay"] = round(latest_decay, 6)
-            data["asset_manager"] = {
-                "agent": "AssetManager",
-                "role": "multi_coin_lead_lag",
-            }
-            return data
-    except Exception:
-        return {
-            "strategy": "ema",
-            "timeframe": "5m",
-            "interval_seconds": 3600,
+    except (FileNotFoundError, json.JSONDecodeError):
+        # Fallback if config is missing or corrupted
+        data = {
+            "strategy": "ema_8_30",
+            "timeframe": "1h",
             "symbol": "BTCUSDT",
-            "alpha_half_life_seconds": 300,
-            "alpha_decay_veto_threshold": 0.5,
-            "online": True,
-            "asset_manager": {
-                "agent": "AssetManager",
-                "role": "multi_coin_lead_lag",
-            },
+            "interval_seconds": 3600
         }
+
+    # 2. Add System Status Flags
+    data["online"] = True # Indicates backend is reachable
+    
+    # 3. Inject Alpha Freshness 
+    # Pull the latest decay factor from the log file to show on the dashboard
+    latest_decay = _latest_signal_decay_from_logs()
+    data["latest_signal_decay"] = round(latest_decay, 6) if latest_decay is not None else 1.0
+    
+    # 4. Include Asset Manager Metadata
+    data["asset_manager_active"] = True
+    
+    return data
 
 
 @app.get("/api/balance")
@@ -340,69 +437,61 @@ def get_balance():
     except json.JSONDecodeError:
         return {"error": "Corrupted balance file"}
 
-@app.post("/api/switch-strategy")
-def switch_strategy(request: StrategySwitchRequest):
-    """Updates the active_policy.json file which the forward test monitors."""
-    config_path = os.path.join(BASE_DIR, 'config', 'active_policy.json')
-    try:
-        # Preserve existing fields (e.g., timeframe, symbol)
-        existing = {}
-        if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                existing = json.load(f)
-        existing.update({
-            "strategy":         request.strategy,
-            "interval_seconds": request.interval_seconds,
-        })
-        with open(config_path, 'w') as f:
-            json.dump(existing, f, indent=4)
-        return {"status": "success", "message": "Policy updated successfully", "data": existing}
-    except Exception as e:
-        return {"error": str(e)}
-
 
 @app.post("/api/update-config")
 def update_config(request: UpdateConfigRequest):
-    """Full config update — persists strategy, timeframe, interval_seconds, and symbol."""
+    """
+    Persists strategy, timeframe, interval, and symbol to active_policy.json.
+    The engine.py loop monitors this file for hot-reloads.
+    """
     config_path = os.path.join(BASE_DIR, 'config', 'active_policy.json')
     try:
+        sym = format_for_delta(request.symbol)
         tf = request.timeframe if request.timeframe in VALID_TIMEFRAMES else "5m"
-        sym = request.symbol
-        if sym not in MULTI_COIN_UNIVERSE:
-            sym = "BTCUSDT"
-        existing = {}
-        if os.path.exists(config_path):
-            try:
-                with open(config_path, 'r', encoding='utf-8') as f:
-                    existing = json.load(f)
-            except (json.JSONDecodeError, OSError):
-                existing = {}
-        existing.update({
+        # Build the payload that both Live and Backtest modes expect
+        new_config = {
             "strategy":         request.strategy.strip().lower(),
             "timeframe":        tf,
             "interval_seconds": int(request.interval_seconds),
             "symbol":           sym,
-        })
-        if "alpha_half_life_seconds" not in existing:
-            existing["alpha_half_life_seconds"] = 300
-        if "alpha_decay_veto_threshold" not in existing:
-            existing["alpha_decay_veto_threshold"] = 0.5
+            "alpha_half_life_seconds": 300, # Defaulting for Risk Manager
+            "alpha_decay_veto_threshold": 0.5,
+            "updated_at":       datetime.now(timezone.utc).isoformat()
+        }
+
+        # Save with atomic write to prevent corruption during an engine read
         os.makedirs(os.path.dirname(config_path), exist_ok=True)
-        with open(config_path, 'w') as f:
-            json.dump(existing, f, indent=4)
-        return {"status": "success", "message": "Config updated", "data": existing}
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(new_config, f, indent=4)
+            
+        print(f"[Config] Policy updated: {new_config['strategy']} on {sym}")
+        return {"status": "success", "message": "Config updated", "data": new_config}
     except Exception as e:
         return {"status": "error", "error": str(e)}
 
 
 @app.post("/api/run-backtest")
 def api_run_backtest(request: BacktestRequest):
-    """Run offline multi-month backtest for a single symbol + strategy (synthetic OHLCV)."""
-    sym = request.symbol if request.symbol in MULTI_COIN_UNIVERSE else "BTCUSDT"
-    strat = (request.strategy or "ema").strip().lower()
-    tf = request.timeframe if request.timeframe in VALID_TIMEFRAMES else "1h"
-    result = run_backtest(sym, strat, timeframe=tf, months=int(request.months))
-    return result
+    """
+    Routes UI backtest requests to the lightning-fast, vectorized Backtest Agent.
+    Bypasses the live execution engine entirely.
+    """
+    symbol = request.symbol
+    strategy = request.strategy
+    timeframe = request.timeframe
+    months = int(request.months)
+    
+    try:
+        # Call your existing fast backtest agent directly!
+        results = run_backtest(
+            symbol=symbol,
+            strategy=strategy,
+            timeframe=timeframe,
+            months=months
+        )
+        return results
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
 
 @app.post("/api/toggle-mode")
 def toggle_mode(request: ToggleModeRequest):
@@ -414,12 +503,27 @@ def toggle_mode(request: ToggleModeRequest):
 
 
 def _normalize_trade_log_entry(log: dict) -> dict:
-    """Ensure symbol + side exist for dashboard / exports (non-destructive for unknown keys)."""
+    """
+    Standardizes trade log entries for UI consumption.
+    Updated to prioritize WOTA execution prices and alpha decay metrics.
+    """
     e = log
+    
+    # 1. Standardize Symbol (Default to BTCUSDT if missing)
     if not e.get("symbol"):
         e["symbol"] = "BTCUSDT"
+        
+    # 2. Prioritize Execution Price (The real price with 10bps slippage)
+    # If execution_price exists (from WOTA trader), use it as the primary entry_price
+    if "execution_price" in e:
+        e["entry_price"] = float(e["execution_price"])
+    elif e.get("entry_price") is not None:
+        e["entry_price"] = float(e["entry_price"])
+
+    # 3. Standardize Signal Type and Side
     st = str(e.get("signal_type", "HOLD")).upper()
     e["signal_type"] = st
+    
     if not e.get("side"):
         if st == "BUY":
             e["side"] = "LONG"
@@ -427,23 +531,29 @@ def _normalize_trade_log_entry(log: dict) -> dict:
             e["side"] = "SHORT"
         else:
             e["side"] = "FLAT"
+
+    # 4. Strategy Normalization (Ensure it matches core_logic keys)
     e["strategy_used"] = e.get("strategy_used", "unknown")
-    e["win_probability"] = e.get("win_probability", 0.0)
+    
+    # 5. ML & Sentiment Metrics
+    e["win_probability"] = float(e.get("win_probability", 0.0))
+    e["sentiment_score"] = float(e.get("sentiment_score", 0.0))
+
+    # 6. Alpha Decay Factor (Critical for Dashboard Freshness Card)
     if e.get("decay_factor") is not None:
         try:
             e["decay_factor"] = float(e["decay_factor"])
         except (TypeError, ValueError):
             e["decay_factor"] = None
-    if e.get("pair_z_score") is not None:
-        try:
-            e["pair_z_score"] = float(e["pair_z_score"])
-        except (TypeError, ValueError):
-            e["pair_z_score"] = None
-    if e.get("pair_p_value") is not None:
-        try:
-            e["pair_p_value"] = float(e["pair_p_value"])
-        except (TypeError, ValueError):
-            pass
+
+    # 7. Cointegration/Pair Metrics (Optional)
+    for key in ["pair_z_score", "pair_p_value"]:
+        if e.get(key) is not None:
+            try:
+                e[key] = float(e[key])
+            except (TypeError, ValueError):
+                if key == "pair_z_score": e[key] = None
+                
     return e
 
 
@@ -474,81 +584,77 @@ def get_logs():
         return []
 
 def _compute_strategy_metrics(trades: list) -> dict:
-    """Compute full quantitative metrics for a set of trades."""
+    """
+    Compute full quantitative metrics for a set of trades.
+    Updated to handle 'execution_price' and 'mock_balance_usdt' from WOTA trader.
+    """
     if not trades:
         return None
 
+    # Use 'pnl' (fractional) for win/loss stats and 'pnl_usdt' for absolute gains
     pnl_list = [t.get("pnl", 0.0) for t in trades]
-    prices   = [t.get("entry_price") for t in trades if t.get("entry_price") is not None]
-
-    # Win / Loss split
-    wins   = [p for p in pnl_list if p > 0]
+    
+    wins = [p for p in pnl_list if p > 0]
     losses = [p for p in pnl_list if p < 0]
 
-    win_rate     = (len(wins) / len(trades) * 100.0) if trades else 0.0
-    avg_win      = float(np.mean(wins))  if wins   else 0.0
-    avg_loss     = float(np.mean(losses)) if losses else 0.0
+    win_rate = (len(wins) / len(trades) * 100.0) if trades else 0.0
+    avg_win = float(np.mean(wins)) if wins else 0.0
+    avg_loss = float(np.mean(losses)) if losses else 0.0
 
-    gross_profit = sum(wins)
-    gross_loss   = abs(sum(losses))
-    profit_factor = (
-        "Infinity" if gross_loss == 0 and gross_profit > 0
-        else 0.0 if gross_loss == 0
-        else round(gross_profit / gross_loss, 2)
-    )
-
-    price_volatility = float(np.std(prices)) if len(prices) > 1 else 0.0
-
-    # Equity curve + Max Drawdown + daily PnL
-    equity      = 1.0
-    peak_equity = 1.0
-    max_drawdown = 0.0
-    daily_pnl: Dict[str, float] = {}
+    # Equity curve and Max Drawdown calculation
+    # We prioritize 'mock_balance_usdt' if available (from backtests/paper)
     equity_curve = []
+    max_drawdown = 0.0
+    peak_equity = -1.0
+    daily_pnl = {}
 
     for t in trades:
-        ts    = t.get("timestamp", "")
-        pnl   = t.get("pnl", 0.0)
-
+        ts = t.get("timestamp", "")
+        # Use the explicit balance if logged, otherwise calculate from PnL
+        balance = t.get("balance_after") or t.get("mock_balance_usdt")
+        
+        if balance:
+            current_equity = float(balance)
+            if peak_equity == -1.0: peak_equity = current_equity
+        else:
+            # Fallback for older logs
+            pnl = t.get("pnl", 0.0)
+            current_equity = (equity_curve[-1]["equity"] * (1 + pnl)) if equity_curve else 10000.0
+        
         if ts:
             date_str = ts.split("T")[0]
-            daily_pnl[date_str] = daily_pnl.get(date_str, 0.0) + pnl
+            daily_pnl[date_str] = daily_pnl.get(date_str, 0.0) + t.get("pnl_usdt", 0.0)
 
-        equity *= (1 + pnl)
-        if equity > peak_equity:
-            peak_equity = equity
-        drawdown = (peak_equity - equity) / peak_equity
+        if current_equity > peak_equity:
+            peak_equity = current_equity
+        
+        drawdown = (peak_equity - current_equity) / peak_equity if peak_equity > 0 else 0
         if drawdown > max_drawdown:
             max_drawdown = drawdown
 
         equity_curve.append({
-            "timestamp":   ts,
-            "equity":      round(equity, 6),
-            "entry_price": t.get("entry_price"),
-            "exit_price":  t.get("exit_price"),
-            "pnl":         pnl,
+            "timestamp": ts,
+            "equity_curve": round(current_equity, 2), # Matches frontend key
+            "price": t.get("execution_price") or t.get("entry_price"),
+            "pnl": t.get("pnl", 0.0)
         })
 
-    # Sharpe Ratio (annualised approximation using daily returns)
+    # Sharpe Ratio calculation (Annualized)
     daily_returns = list(daily_pnl.values())
+    sharpe = 0.0
     if len(daily_returns) > 1:
-        mean_r = np.mean(daily_returns)
-        std_r  = np.std(daily_returns)
-        sharpe = float(mean_r / std_r * np.sqrt(252)) if std_r > 0 else 0.0
-    else:
-        sharpe = 0.0
+        std_r = np.std(daily_returns)
+        sharpe = float(np.mean(daily_returns) / std_r * np.sqrt(252)) if std_r > 0 else 0.0
 
     return {
-        "total_trades":          len(trades),
-        "win_rate_percent":      round(win_rate, 2),
-        "sharpe_ratio":          round(sharpe, 2),
-        "max_drawdown_percent":  round(max_drawdown * 100.0, 2),
-        "profit_factor":         profit_factor,
-        "avg_win_percent":       round(avg_win * 100.0, 2),
-        "avg_loss_percent":      round(avg_loss * 100.0, 2),
-        "price_volatility":      round(price_volatility, 2),
-        "daily_pnl":             daily_pnl,      # { "YYYY-MM-DD": float }  → Calendar
-        "equity_curve":          equity_curve,   # [ {timestamp, equity, entry_price, exit_price, pnl} ] → Chart
+        "total_trades": len(trades),
+        "win_rate": round(win_rate, 2),
+        "sharpe_ratio": round(sharpe, 2),
+        "max_drawdown_pct": round(max_drawdown * 100.0, 2),
+        "avg_win_percent": round(avg_win * 100.0, 2),
+        "avg_loss_percent": round(avg_loss * 100.0, 2),
+        "daily_pnl": daily_pnl,
+        "curve_data": equity_curve  # Primary key for BacktestPage.jsx
     }
 
 
@@ -572,7 +678,7 @@ def get_analytics():
     veto_count = sum(1 for l in raw_logs if str(l.get("status", "")).lower() == "vetoed")
 
     # All strategies (always present in response even if empty)
-    STRATEGIES = ["ema", "rsi", "bollinger", "trendline", "macd", "pairs_trading", "mean_reversion"]
+    STRATEGIES = ["ema_8_30", "ema_9_15", "trendline_break"]
 
     empty_response = {
         "global_metrics": {
@@ -609,19 +715,8 @@ def get_analytics():
     global_m = _compute_strategy_metrics(executed_trades)
 
     return {
-        "global_metrics": {
-            "total_trades":          len(executed_trades),   # ONLY executed, never vetoed
-            "total_vetoes":          veto_count,
-            "win_rate_percent":      global_m["win_rate_percent"],
-            "sharpe_ratio":          global_m["sharpe_ratio"],
-            "max_drawdown_percent":  global_m["max_drawdown_percent"],
-            "profit_factor":         global_m["profit_factor"],
-            "avg_win_percent":       global_m["avg_win_percent"],
-            "avg_loss_percent":      global_m["avg_loss_percent"],
-            "daily_pnl":             global_m["daily_pnl"],
-            "equity_curve":          global_m["equity_curve"],
-        },
-        "by_strategy": by_strategy,
+        "global_metrics": global_m,
+        "by_strategy": by_strategy
     }
 
 # --- WebSocket Endpoints ---

@@ -14,15 +14,16 @@ def generate_signals(df: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     
     true_range = pd.concat([high_low, high_prev_close, low_prev_close], axis=1).max(axis=1)
     atr = true_range.ewm(alpha=1/14, adjust=False).mean()
+    natr = (atr / df['close']) * 100
     
     # 3. Slope & Separation Mechanics
     # Separation: The ribbon must be fanned out (distance proxy)
-    ribbon_dist = (ema9 - ema15).abs()
-    is_separated = ribbon_dist > (atr * 0.2)
+    ribbon_dist = ((ema9 - ema15).abs() / df['close']) * 100
+    is_separated = ribbon_dist > (natr * 0.2)
     
     # True Slope: The 15 EMA must be moving directionally over a 5-bar window
-    ema15_roc = ema15.diff(5) 
-    min_slope = atr * 0.1 # Slope must exceed 10% of ATR over 5 bars
+    ema15_roc = ((ema15 - ema15.shift(5)) / df['close']) * 100 
+    min_slope = natr * 0.1 # Slope must exceed 10% of NATR over 5 bars
     
     strong_up_slope = is_separated & (ema15_roc > min_slope) & (ema15 > ema50)
     strong_down_slope = is_separated & (ema15_roc < -min_slope) & (ema15 < ema50)

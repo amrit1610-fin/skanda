@@ -10,6 +10,7 @@ Changes from legacy:
 """
 from __future__ import annotations
 
+import ccxt
 import hashlib
 import importlib
 from datetime import datetime, timezone
@@ -64,26 +65,39 @@ def _strategy_fn(strategy: str) -> Callable[[pd.DataFrame], dict]:
     return getattr(mod, "analyze")
 
 
-def _synthetic_ohlcv(symbol: str, n_bars: int, timeframe: str) -> pd.DataFrame:
-    """Reproducible GBM-style OHLCV for offline backtests."""
-    seed = int(hashlib.sha256(f"{symbol}:{timeframe}".encode()).hexdigest()[:8], 16) % (2**31)
-    rng  = np.random.default_rng(seed)
+def fetch_real_historical_data(symbol: str, timeframe: str, n_bars: int) -> pd.DataFrame:
+    """Fetches real historical OHLCV data from Binance for backtesting."""
+    print(f"[*] Fetching {n_bars} bars of real {timeframe} data for {symbol}...")
+    
+    exchange = ccxt.binance({'enableRateLimit': True})
+    
+    # Binance limits fetch_ohlcv to 1000 bars per request. 
+    # For a deep backtest, we need to paginate.
+    all_ohlcv = []
+    limit = 1000
+    
+    # Calculate how far back we need to go in milliseconds
+    # 5m = 300,000ms | 1h = 3,600,000ms
+    tf_ms_map = {"5m": 300000, "15m": 900000, "1h": 3600000, "4h": 14400000}
+    ms_per_candle = tf_ms_map.get(timeframe, 3600000)
+    
+    since = exchange.milliseconds() - (n_bars * ms_per_candle)
+    
+    while len(all_ohlcv) < n_bars:
+        try:
+            bars = exchange.fetch_ohlcv(symbol, timeframe, since=since, limit=limit)
+            if not bars:
+                break
+            all_ohlcv.extend(bars)
+            since = bars[-1][0] + 1 # Next candle timestamp
+        except Exception as e:
+            print(f"[!] CCXT Fetch Error: {e}")
+            break
 
-    mu, sigma = 1.2e-5, 0.012
-    r     = rng.normal(mu, sigma, n_bars)
-    base  = 50.0 + (seed % 10000) / 100.0
-    close = base * np.cumprod(1.0 + r)
-
-    noise_hi = np.abs(rng.normal(0, 0.004, n_bars))
-    noise_lo = np.abs(rng.normal(0, 0.004, n_bars))
-
-    df = pd.DataFrame({
-        "open":   close * (1.0 + rng.uniform(-0.002, 0.002, n_bars)),
-        "high":   close * (1.0 + noise_hi),
-        "low":    close * (1.0 - noise_lo),
-        "close":  close,
-        "volume": rng.integers(500, 8000, n_bars).astype(float),
-    })
+    # Trim to exact requested length and format
+    df = pd.DataFrame(all_ohlcv[-n_bars:], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
+    
     return df
 
 
@@ -123,8 +137,13 @@ def _generate_signals(df: pd.DataFrame, strategies: list) -> pd.DataFrame:
     
     for strategy_name in strategies:
         try:
-            module = importlib.import_module(f"strategies.{strategy_name}")
-            buy_cond, sell_cond = module.generate_signals(df)
+            if strategy_name.lower() == "ensemble_alpha":
+                from agents.ensemble_manager import StrategyEnsemble
+                ensemble = StrategyEnsemble()
+                buy_cond, sell_cond = ensemble.get_ensemble_signals(df)
+            else:
+                module = importlib.import_module(f"strategies.{strategy_name}")
+                buy_cond, sell_cond = module.generate_signals(df)
             
             sig_df[strategy_name] = 0
             sig_df.loc[buy_cond, strategy_name] = 1
@@ -210,6 +229,12 @@ def _run_bracket_simulation(df: pd.DataFrame, pm: PortfolioManager) -> Dict[str,
             
             votes = row['strategy_votes']
             sl_dist, tp_dist = pm.calculate_blended_risk(votes, atr)
+            
+            # Apply dynamic SL/TP overrides if set by ensemble manager
+            if 'sl_override' in row and not pd.isna(row['sl_override']):
+                sl_dist = float(row['sl_override']) * atr
+            if 'tp_override' in row and not pd.isna(row['tp_override']):
+                tp_dist = float(row['tp_override']) * atr
 
             if sig == 1:        # LONG
                 position_type = "long"
@@ -285,8 +310,7 @@ def run_backtest(
         n_bars = int(round(n_bars * (months / BACKTEST_MONTHS)))
 
     # ── Build base OHLCV ──────────────────────────────────────────────────────
-    df = _synthetic_ohlcv(symbol, n_bars, tf)
-    df = _attach_timestamps(df, tf)
+    df = fetch_real_historical_data(symbol, tf, n_bars)
 
     # ── Feature Engineering ───────────────────────────────────────────────────
     try:

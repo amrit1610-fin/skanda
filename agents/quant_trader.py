@@ -4,65 +4,26 @@ import random
 import time
 import ccxt
 from datetime import datetime, timezone
+from dotenv import load_dotenv
+
 from .base_agent import ReActAgent
 from .risk_manager import RiskManager
 
+# Load environment variables from .env file
+load_dotenv()
+
 # ─── Constants ───────────────────────────────────────────────────────────────
-RISK_PER_TRADE   = 0.02      # 2% of current balance risked per trade
-MOCK_HOLD_SECS   = 5         # Seconds to "hold" a position before exit (paper)
-BALANCE_FILE     = os.path.join(os.path.dirname(__file__), '..', 'logs', 'account_balance.json')
-TRADE_LOG_FILE   = os.path.join(os.path.dirname(__file__), '..', 'logs', 'trade_history.json')
+RISK_PER_TRADE    = 0.02      # 2% of current balance risked per trade
+TRADE_LOG_FILE    = os.path.join(os.path.dirname(__file__), '..', 'logs', 'trade_history.json')
 
-DELTA_SYMBOL_MAP = {
-    "BTCUSDT": "BTC/USDT:USDT",
-    "ETHUSDT": "ETH/USDT:USDT",
-    "BTC/USDT": "BTC/USDT:USDT",
-}
-
-# ─── Wallet Helpers ───────────────────────────────────────────────────────────
-
-def _read_balance() -> dict:
-    """Read the paper trading wallet from disk."""
-    try:
-        with open(BALANCE_FILE, 'r') as f:
-            return json.load(f)
-    except (FileNotFoundError, json.JSONDecodeError):
-        default = {
-            "balance_usdt":    10000.00,
-            "initial_capital": 10000.00,
-            "currency":        "USDT",
-            "last_updated":    datetime.now(timezone.utc).isoformat(),
-            "trade_count":     0
-        }
-        _write_balance(default)
-        return default
-
-def _write_balance(wallet: dict):
-    """Persist the paper trading wallet to disk."""
-    wallet["last_updated"] = datetime.now(timezone.utc).isoformat()
-    os.makedirs(os.path.dirname(BALANCE_FILE), exist_ok=True)
-    with open(BALANCE_FILE, 'w') as f:
-        json.dump(wallet, f, indent=4)
-
-# ─── Price Fetcher ────────────────────────────────────────────────────────────
-
-def _fetch_real_price(symbol: str) -> float | None:
-    """
-    Fetches the real-time last price from Delta Exchange India (testnet) via ccxt.
-    Falls back gracefully if ccxt is unavailable or the call fails.
-    """
-    try:
-        import ccxt
-        exchange = ccxt.delta({
-            "options": {"defaultType": "future"},
-        })
-        # Normalise symbol to CCXT format
-        ccxt_symbol = DELTA_SYMBOL_MAP.get(symbol, symbol)
-        ticker = exchange.fetch_ticker(ccxt_symbol)
-        price  = ticker.get("last") or ticker.get("close")
-        return float(price) if price else None
-    except Exception as e:
-        return None
+def format_for_binance(symbol: str) -> str:
+    """Dynamically converts standard symbols (e.g., BTCUSDT) to Binance CCXT format (BTC/USDT)."""
+    symbol = symbol.upper().replace("-", "").replace("_", "")
+    if "/" in symbol:
+        return symbol.split(":")[0]
+    if symbol.endswith("USDT"):
+        return f"{symbol[:-4]}/USDT"
+    return symbol
 
 # ─── Agent ────────────────────────────────────────────────────────────────────
 
@@ -71,11 +32,39 @@ class QuantTrader(ReActAgent):
         skill_path = os.path.join(os.path.dirname(__file__), '..', '.skills', 'quant_trader', 'system_prompt.md')
         super().__init__("QuantTrader", skill_path)
         self.risk_manager = RiskManager()
-        self.exchange = ccxt.delta({
-            "options": {"defaultType": "future"},
+        
+        # 1. Initialize LIVE Mainnet Exchange (Only if keys exist)
+        mainnet_key = os.getenv("BINANCE_API_KEY", "")
+        mainnet_secret = os.getenv("BINANCE_API_SECRET", "")
+        
+        if mainnet_key and mainnet_secret:
+            self.mainnet_exchange = ccxt.binance({
+                'apiKey': mainnet_key,
+                'secret': mainnet_secret,
+                'enableRateLimit': True,
+                'options': {'defaultType': 'future'} # or 'spot' based on your preference
+            })
+        else:
+            self.mainnet_exchange = None
+            self.think("[!] No mainnet keys found in .env. Live trading is disabled.")
+        
+        # 2. Initialize PAPER Testnet Exchange
+        testnet_key = os.getenv("BINANCE_TESTNET_API_KEY", "")
+        testnet_secret = os.getenv("BINANCE_TESTNET_API_SECRET", "")
+        
+        self.testnet_exchange = ccxt.binance({
+            'apiKey': testnet_key,
+            'secret': testnet_secret,
+            'enableRateLimit': True,
+            'options': {'defaultType': 'future'}
         })
+        # This tells CCXT to route orders to testnet.binance.vision instead of mainnet
+        self.testnet_exchange.set_sandbox_mode(True) 
+        
+        if not testnet_key:
+            self.think("[!] WARNING: Binance Testnet API keys not found in .env. Paper trading will fail.")
+
         self._ensure_log_file()
-        self._ensure_balance_file()
 
     # ── Setup ────────────────────────────────────────────────────────────────
 
@@ -84,16 +73,6 @@ class QuantTrader(ReActAgent):
         if not os.path.exists(TRADE_LOG_FILE):
             with open(TRADE_LOG_FILE, 'w') as f:
                 json.dump([], f)
-
-    def _ensure_balance_file(self):
-        if not os.path.exists(BALANCE_FILE):
-            self.think("Initialising paper trading wallet with $10,000 USDT.")
-            _write_balance({
-                "balance_usdt":    10000.00,
-                "initial_capital": 10000.00,
-                "currency":        "USDT",
-                "trade_count":     0
-            })
 
     # ── Trade Log ────────────────────────────────────────────────────────────
 
@@ -107,174 +86,118 @@ class QuantTrader(ReActAgent):
 
         history.append(record)
 
-        with open(TRADE_LOG_FILE, 'w') as f:
-            json.dump(history, f, indent=4)
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with open(TRADE_LOG_FILE, 'w', encoding='utf-8') as f:
+                    json.dump(history, f, indent=4)
+                break 
+            except Exception as e:
+                if attempt == max_retries - 1:
+                    print(f"[QuantTrader] Failed to write to trade_history.json: {e}")
+                time.sleep(random.uniform(0.1, 0.5))
 
     # ── Core Execution ───────────────────────────────────────────────────────
 
-    def execute_trade(self, approved_trade: dict, market_data: dict | None):
+    def execute_trade(self, approved_trade: dict, market_data: dict | None, is_paper: bool = True):
         """
-        Paper-executes a risk-approved trade:
-          1. Reads current wallet balance
-          2. Fetches real-time price via ccxt (falls back to mock OHLCV close)
-          3. Calculates quantity based on 2% risk
-          4. Mocks a hold period, then computes exit price
-          5. Updates account_balance.json
-          6. Writes full trade record to trade_history.json
+        The Universal Execution Engine.
+        Dynamically routes to Binance Mainnet or Binance Testnet based on the UI toggle.
         """
-        self.think("Paper-executing approved trade with real-time price fetch...")
+        mode_str = "PAPER" if is_paper else "LIVE"
+        self.think(f"Executing trade in {mode_str} mode...")
 
-        # ── 1. Symbol & strategy ────────────────────────────────────────────
-        symbol   = "BTCUSDT"
+        # 🚨 FAILSAFE: Abort if live trading is attempted without configured keys
+        if not is_paper and not self.mainnet_exchange:
+            self.think("[!] FATAL: Attempted to execute LIVE trade without Mainnet API keys.")
+            return {"status": "failed", "reason": "Live trading disabled (No API Keys)"}
+
+        # Select the correct exchange network based on the UI toggle
+        active_exchange = self.testnet_exchange if is_paper else self.mainnet_exchange
+
+        symbol   = approved_trade.get("symbol", "BTCUSDT")
         strategy = approved_trade.get("strategy_used", "unknown")
-        signal   = approved_trade.get("signal_type",   "BUY").upper()
+        signal   = approved_trade.get("signal_type",   "HOLD").upper()
+        
+        if signal not in ["BUY", "SELL"]:
+            return {"status": "skipped", "reason": "No valid direction"}
 
-        if market_data is not None:
-            symbol = market_data.get("symbol", symbol)
+        # Fetch current price directly from the active Binance network
+        ccxt_symbol = format_for_binance(symbol)
+        try:
+            ticker = active_exchange.fetch_ticker(ccxt_symbol)
+            entry_price = float(ticker.get("last") or ticker.get("close"))
+        except Exception as e:
+            self.think(f"[!] Failed to fetch price from Binance: {e}")
+            return {"status": "failed", "reason": "Exchange price fetch failed"}
 
-        # ── 2. Wallet ────────────────────────────────────────────────────────
-        wallet          = _read_balance()
-        balance_before  = wallet["balance_usdt"]
-        initial_capital = wallet.get("initial_capital", balance_before)
-
-        self.think(f"Wallet balance before trade: ${balance_before:,.2f} USDT")
-
-        # ── 3. Real-time entry price ─────────────────────────────────────────
-        entry_price = _fetch_real_price(symbol)
-        price_source = "ccxt_live"
-
-        if entry_price is None:
-            # Fallback: use last close from mock OHLCV data
-            price_source = "mock_ohlcv"
-            try:
-                ohlcv = market_data.get("ohlcv_data") if market_data else None
-                if ohlcv is not None and not ohlcv.empty:
-                    entry_price = float(ohlcv.iloc[-1]["close"])
-            except Exception:
-                pass
-
-        if entry_price is None or entry_price <= 0:
-            # Final fallback: plausible BTC price range
-            entry_price  = random.uniform(58000, 72000)
-            price_source = "fallback_mock"
-
-        self.think(f"Entry price: ${entry_price:,.2f} ({price_source})")
-        current_price = entry_price
-
-        # ── 4. Position sizing (2% risk rule) ────────────────────────────────
-        risk_amount = balance_before * RISK_PER_TRADE          # $200 on $10k
-        amount    = round(risk_amount / current_price, 6)       # BTC units
-        quantity = amount
-
-        self.think(f"Risk amount: ${risk_amount:.2f} | Quantity: {quantity:.6f} {symbol.replace('USDT','')}")
-
-        # ── 5. Bracketed Limit Order Execution ───────────────────────────────
         side = "buy" if signal == "BUY" else "sell"
-        brackets = self.risk_manager.calculate_trade_brackets(side, current_price)
+        brackets = self.risk_manager.calculate_trade_brackets(side, entry_price)
+
+        # 1. Fetch Real Balance safely (BUG-04 Fix)
+        try:
+            self.think(f"Fetching {mode_str} USDT balance from Binance...")
+            balance_data = active_exchange.fetch_balance()
+            
+            # Safely extract USDT, falling back to 0.0 if the account is empty
+            usdt_info = balance_data.get('USDT') or balance_data.get('total', {})
+            available_usdt = float((usdt_info or {}).get('free', 0.0))
+            
+            if available_usdt <= 0:
+                self.think(f"[!] {mode_str} USDT balance is zero or not found.")
+                return {"status": "failed", "reason": "Zero USDT balance"}
+                
+        except Exception as e:
+            self.think(f"[!] Failed to fetch Binance balance: {e}.")
+            return {"status": "failed", "reason": "Could not fetch exchange balance"}
+        
+        # 2. Position Sizing
+        risk_amount = available_usdt * RISK_PER_TRADE  
+        amount = round(risk_amount / entry_price, 6)
+        
+        if risk_amount < 10.0:
+            self.think(f"[!] Trade size ({risk_amount:.2f} USDT) below Binance minimums. Skipping.")
+            return {"status": "skipped", "reason": "Trade size below exchange minimum"}
         
         params = {
             'stopLossPrice': brackets['stop_loss'],
             'takeProfitPrice': brackets['take_profit']
         }
 
+        # 3. Execution
         try:
-            # Normalise symbol to CCXT format
-            ccxt_symbol = DELTA_SYMBOL_MAP.get(symbol, symbol)
-            order = self.exchange.create_order(ccxt_symbol, 'limit', side, amount, current_price, params)
-            print(f"[QuantTrader] Executing LIMIT {side} at {current_price} | SL: {brackets['stop_loss']} | TP: {brackets['take_profit']}")
+            order = active_exchange.create_order(ccxt_symbol, 'limit', side, amount, entry_price, params)
+            self.think(f"[QuantTrader] {mode.upper()} LIMIT {side} placed at {entry_price}")
+            
+            status_flag = "live_executed" if mode == "live" else "paper_executed"
+            record = self._build_record(symbol, strategy, signal, entry_price, amount, approved_trade, status_flag)
+            self._append_trade(record)
+            
+            return {"status": "success", "fill_price": entry_price}
+            
         except Exception as e:
-            self.think(f"Order Execution Failed: {e}")
-            # Fallback for paper testing or if API fails
-            pass
+            self.think(f"{mode.upper()} Order Execution Failed: {e}")
+            return {"status": "failed", "reason": str(e)}
 
-        # ── 6. Mock hold (Wait for fill/exit in paper mode context) ──────────
-        self.think(f"Holding position for {MOCK_HOLD_SECS}s (monitoring brackets)...")
-        time.sleep(MOCK_HOLD_SECS)
-
-        # Random PnL: uniform between -1.5% and +3.5% (asymmetric for realism)
-        pnl_pct    = random.uniform(-0.015, 0.035)
-        exit_price = round(entry_price * (1 + pnl_pct), 4)
-
-        # ── 6. Actual P&L in USDT ────────────────────────────────────────────
-        gross_pnl_usdt  = (exit_price - entry_price) * quantity
-        if signal == "SELL":
-            gross_pnl_usdt = -gross_pnl_usdt      # short direction
-
-        balance_after   = round(balance_before + gross_pnl_usdt, 4)
-        pnl_pct_actual  = round(pnl_pct if signal != "SELL" else -pnl_pct, 6)
-
-        self.think(
-            f"Exit price: ${exit_price:,.2f} | Gross PnL: ${gross_pnl_usdt:+.2f} | "
-            f"New balance: ${balance_after:,.2f}"
-        )
-
-        # ── 7. Update wallet ─────────────────────────────────────────────────
-        wallet["balance_usdt"]  = balance_after
-        wallet["trade_count"]   = wallet.get("trade_count", 0) + 1
-        _write_balance(wallet)
-
-        # ── 8. Write full trade record ───────────────────────────────────────
-        record = {
+    def _build_record(self, symbol, strategy, signal, price, quantity, approved_trade, status):
+        return {
             "timestamp":       datetime.now(timezone.utc).isoformat(),
             "symbol":          symbol,
             "strategy_used":   strategy,
             "signal_type":     signal,
-            "side":            "LONG" if signal == "BUY" else "SHORT" if signal == "SELL" else "FLAT",
-            "status":          "executed",
-            "decay_factor":    approved_trade.get("decay_factor"),
+            "side":            "LONG" if signal == "BUY" else "SHORT",
+            "status":          status,
             "win_probability": approved_trade.get("win_probability", 0),
             "sentiment_score": approved_trade.get("sentiment_score", 0),
-            # Position details
-            "entry_price":     round(entry_price, 4),
-            "exit_price":      round(exit_price,  4),
-            "quantity":        quantity,
-            "price_source":    price_source,
-            # Capital / P&L
-            "initial_capital": initial_capital,
-            "balance_before":  round(balance_before, 4),
-            "balance_after":   round(balance_after,  4),
-            "pnl_usdt":        round(gross_pnl_usdt, 4),
-            "pnl":             pnl_pct_actual,          # fractional, used by analytics
-            "final_pnl":       round(gross_pnl_usdt, 4),
+            "execution_price": round(price, 4),
+            "quantity":        round(quantity, 6),
         }
 
-        if approved_trade.get("signal_from_cointegration"):
-            pz = approved_trade.get("pair_z_score")
-            pp = approved_trade.get("pair_p_value")
-            if pz is not None:
-                record["pair_z_score"] = float(pz)
-            if pp is not None:
-                try:
-                    record["pair_p_value"] = float(pp)
-                except (TypeError, ValueError):
-                    record["pair_p_value"] = pp
-            if approved_trade.get("pair_leg_x"):
-                record["pair_leg_x"] = approved_trade.get("pair_leg_x")
-
-        self._append_trade(record)
-        self.think(f"Trade logged. Wallet updated: ${balance_before:,.2f} → ${balance_after:,.2f}")
-
-        return self.act("execute_trade", {
-            "status":        "executed",
-            "symbol":        symbol,
-            "entry_price":   entry_price,
-            "exit_price":    exit_price,
-            "quantity":      quantity,
-            "pnl_usdt":      round(gross_pnl_usdt, 4),
-            "pnl":           pnl_pct_actual,
-            "balance_after": balance_after,
-        })
-
-    # ── Veto logging (called by RiskManager path for consistency) ────────────
-
-    def log_trade_event(self, strategy_used, signal_type, win_probability,
-                        sentiment_score, status, entry_price=None,
-                        exit_price=None, position_size=None, mocked_pnl=None, **kwargs):
-        """Backwards-compatible veto log writer (no wallet update for vetoed trades)."""
+    def log_trade_event(self, strategy_used, signal_type, win_probability, sentiment_score, status, **kwargs):
+        """Veto log writer used by Risk Manager."""
         st = (signal_type or "HOLD").upper()
-        side = kwargs.get("side")
-        if not side:
-            side = "LONG" if st == "BUY" else "SHORT" if st == "SELL" else "FLAT"
+        side = "LONG" if st == "BUY" else "SHORT" if st == "SELL" else "FLAT"
+        
         record = {
             "timestamp":       datetime.now(timezone.utc).isoformat(),
             "symbol":          kwargs.get("symbol", "BTCUSDT"),
@@ -284,10 +207,14 @@ class QuantTrader(ReActAgent):
             "win_probability": win_probability,
             "sentiment_score": sentiment_score,
             "status":          status,
-            "entry_price":     entry_price,
-            "exit_price":      exit_price,
-            "quantity":        position_size,
-            "pnl":             mocked_pnl,
             "reason":          kwargs.get("reason", ""),
         }
         self._append_trade(record)
+
+    def get_backtest_logs(self) -> list:
+        try:
+            with open(TRADE_LOG_FILE, 'r', encoding='utf-8') as f:
+                history = json.load(f)
+            return [t for t in history if t.get("status") == "paper_executed"]
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []

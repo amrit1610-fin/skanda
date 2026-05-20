@@ -1,21 +1,113 @@
-# Python
+# ─────────────────────────────────────────────────────────────────────────────
+# .gitignore — Skanda Autonomous Trading Bot
+# Production-hardened for portfolio deployment.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Python Runtime ────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
-.env
+*.pyd
+*.pyo
+*.pyw
+.Python
+
+# ── Virtual Environments ──────────────────────────────────────────────────────
 venv/
 env/
+.venv/
+ENV/
+.env.bak
 
-# Models & Large Files (RTX 3050 local paths)
-models/*.cbm
+# ── SECRETS — NEVER COMMIT ───────────────────────────────────────────────────
+.env
+.env.local
+.env.*.local
+secrets.json
+*.pem
+*.key
+
+# ── HuggingFace / PyTorch Model Weights (large binaries) ─────────────────────
+models/
+*.cbm
+*.pt
+*.pth
+*.safetensors
+*.gguf
+*.bin
+.cache/
+huggingface/
+
+# ── CatBoost Training Artifacts ───────────────────────────────────────────────
+catboost_info/
+catboost_training.json
+
+# ── Agent Skills (persona prompts, private IP) ────────────────────────────────
 .skills/
 
-# Data & Logs
-trade_history.json
-account_balance.json
-logs/*.log
+# ── Runtime Logs & Session State ─────────────────────────────────────────────
+logs/
+*.log
+*.log.*
 
-# Node (MERN)
+# ── Live Trading State (real account data — never commit) ────────────────────
+logs/trade_history.json
+logs/account_balance.json
+data/risk_memory/
+
+# ── Database files ────────────────────────────────────────────────────────────
+*.db
+*.sqlite
+*.sqlite3
+chroma.sqlite3
+
+# ── Node / Frontend Build ─────────────────────────────────────────────────────
 node_modules/
 dist/
+build/
+.next/
+.nuxt/
+frontend/dist/
+frontend/build/
+
+# ── Vite / ESBuild Cache ──────────────────────────────────────────────────────
+.vite/
+*.tsbuildinfo
+
+# ── macOS ─────────────────────────────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+
+# ── Windows ───────────────────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ── VS Code (keep workspace settings, ignore user overrides) ─────────────────
+.vscode/settings.json
+.vscode/launch.json
+
+# ── Jupyter / Data Science Notebooks ─────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── ML Dataset (large CSV — use DVC or S3 instead) ───────────────────────────
+BTCUSD_ml_dataset.csv
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.bak
+*.tmp
+*.swp
+*~
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+htmlcov/
+.coverage
+coverage.xml

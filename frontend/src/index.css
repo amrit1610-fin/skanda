@@ -775,6 +775,20 @@ body,
   }
 }
 
+/* Amber pulse for the Demo Mode indicator dot */
+@keyframes demo-badge-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 5px #fb923c;
+    opacity: 1;
+  }
+
+  50% {
+    box-shadow: 0 0 14px #fb923c, 0 0 24px rgba(251, 146, 60, 0.4);
+    opacity: 0.65;
+  }
+}
+
 /* ═══════════════════════════════════════════════
    Settings Page Form
    ═══════════════════════════════════════════════ */

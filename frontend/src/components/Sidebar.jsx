@@ -12,7 +12,7 @@ const NAV_ITEMS = [
   { id: 'settings', label: 'Settings', icon: SlidersHorizontal },
 ];
 
-function Sidebar({ activePage, onNavigate, isLive, systemMode }) {
+function Sidebar({ activePage, onNavigate, isLive, systemMode, isDemoMode }) {
   return (
     <aside className="sidebar" style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {/* ── Logo ────────────────────────────────── */}
@@ -43,15 +43,34 @@ function Sidebar({ activePage, onNavigate, isLive, systemMode }) {
         })}
       </nav>
 
-      {/* ── Footer: Live badge ──────────────────── */}
+      {/* ── Footer: connection status ────────────── */}
       <div className="sidebar-footer" style={{ marginTop: 'auto' }}>
-        <div className={`live-indicator${isLive ? ' online' : ' offline'}`}>
-          <span className={`pulse-dot${isLive ? '' : ' red'}`} />
-          {isLive ? 'System Live' : 'Backend Offline'}
-        </div>
+        {isDemoMode ? (
+          /* Amber Demo Mode indicator */
+          <div
+            className="live-indicator"
+            style={{ color: '#fb923c' }}
+          >
+            <span
+              className="pulse-dot"
+              style={{
+                background: '#fb923c',
+                boxShadow:  '0 0 6px #fb923c',
+                animation:  'demo-badge-pulse 2s ease-in-out infinite',
+              }}
+            />
+            Demo Mode
+          </div>
+        ) : (
+          <div className={`live-indicator${isLive ? ' online' : ' offline'}`}>
+            <span className={`pulse-dot${isLive ? '' : ' red'}`} />
+            {isLive ? 'System Live' : 'Backend Offline'}
+          </div>
+        )}
       </div>
     </aside>
   );
 }
 
 export default Sidebar;
+
