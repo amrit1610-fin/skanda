@@ -35,6 +35,7 @@ ccxt==4.2.80
 
 # ── Agent Intelligence & Memory ───────────────────────────────────────────────
 mem0ai==0.1.13
+anthropic==0.34.0
 
 # ── Vector Store (used by Mem0 / RiskManager) ────────────────────────────────
 chromadb==0.4.24

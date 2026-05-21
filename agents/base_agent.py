@@ -3,12 +3,22 @@ import re
 import json
 import importlib
 from datetime import datetime
+import anthropic
 
 class ReActAgent:
     def __init__(self, name, skill_path=None):
         self.name = name
         self.system_prompt = ""
         self.active_tool = None
+        self.model_name = "claude-3-5-sonnet-20241022"
+        
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if api_key:
+            self.llm_client = anthropic.Anthropic(api_key=api_key)
+        else:
+            self.llm_client = None
+            print(f"[{self.name}] Warning: ANTHROPIC_API_KEY not found in environment. LLM disabled.")
+            
         if skill_path:
             self.load_skills(skill_path)
 
@@ -98,3 +108,68 @@ class ReActAgent:
                 f.write(json.dumps(payload) + "\n")
         except Exception as log_err:
             print(f"[{self.name}] WARNING: Failed to write to agent_stream.log: {log_err}")
+
+    def evaluate(self, market_data: dict):
+        """
+        Gathers tool data, builds the context payload, and calls the Anthropic API
+        for a decision, then safely parses the resulting JSON.
+        """
+        # 1. Gather local data/indicators via tools
+        tool_results = self.enforce_tool_execution(market_data)
+
+        if not self.llm_client:
+            self.think("Evaluation aborted: Anthropic client not initialized (missing API key).")
+            return None
+
+        self.think("Sending data to Claude...")
+
+        # 2. Construct the payload
+        # Pandas DataFrames might be in market_data, so we provide a safe serializer fallback
+        def safe_serialize(obj):
+            if hasattr(obj, 'to_dict'):
+                return obj.to_dict()
+            if hasattr(obj, 'tolist'):
+                return obj.tolist()
+            return str(obj)
+
+        payload_obj = {
+            "market_data": market_data,
+            "tool_results": tool_results
+        }
+
+        try:
+            user_message = json.dumps(payload_obj, default=safe_serialize)
+        except Exception as e:
+            self.think(f"Warning: JSON serialization failed ({e}), converting payload to string.")
+            user_message = str(payload_obj)
+
+        # 3. Call the Claude API
+        try:
+            response = self.llm_client.messages.create(
+                model=self.model_name,
+                max_tokens=1024,
+                system=self.system_prompt if self.system_prompt else "You are an autonomous agent.",
+                messages=[
+                    {"role": "user", "content": user_message}
+                ]
+            )
+            
+            response_text = response.content[0].text
+            self.think("Received response from Claude.")
+            
+            # 4. Safely parse JSON from the response text
+            match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if match:
+                json_str = match.group(0)
+            else:
+                json_str = response_text
+                
+            decision = json.loads(json_str)
+            return decision
+
+        except json.JSONDecodeError as e:
+            self.think(f"Error parsing JSON from Claude response: {e}\nResponse was: {response_text}")
+            return None
+        except Exception as e:
+            self.think(f"Error during Anthropic API call: {e}")
+            return None
