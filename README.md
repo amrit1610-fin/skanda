@@ -269,5 +269,5 @@ Skanda is a research and portfolio project. It is **not financial advice**. Cryp
 ---
 
 <div align="center">
-Built with ⚡ by Kusha &nbsp;|&nbsp; MIT License
+Built with ⚡ by Amritanshu &nbsp;|&nbsp; MIT License
 </div>
