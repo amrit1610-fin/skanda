@@ -14,6 +14,7 @@
 ---
 
 **Skanda** is a production-grade autonomous trading system that deploys a council of five specialized ReAct AI agents — each with its own reasoning loop, memory, and skill set — to analyze macro market regimes, generate quantitative signals, and execute bracketed limit orders on Binance in real time. Unlike prompt-chaining demos, every agent in Skanda runs deterministic, auditable Python inference: FinBERT for live sentiment scoring, a CatBoost ML classifier for win-probability gating, and a weighted six-timeframe EMA/SMA regime classifier to prevent counter-trend execution.
+You can visit here - *https://skanda-livid.vercel.app/*
 
 ---
 
